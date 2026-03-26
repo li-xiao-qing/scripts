@@ -199,10 +199,15 @@ collect_discovery() {
 collect_driver_firmware() {
     log_header "1. 驱动 & 固件"
 
-    local drv_ver
-    drv_ver=$(ofed_info -s 2>/dev/null | sed 's/.*MLNX_OFED_LINUX-//;s/:.*//' | xargs)
-    [[ -z "$drv_ver" ]] && drv_ver=$(modinfo mlx5_core 2>/dev/null | awk '/^version:/{print $2}')
-    print_val "驱动版本 (OFED)" "${drv_ver:-N/A}"
+    local ofed_ver
+    ofed_ver=$(ofed_info -s 2>/dev/null | sed 's/.*MLNX_OFED_LINUX-//;s/:.*//' | xargs)
+    print_val "驱动版本 (OFED)" "${ofed_ver:-N/A}"
+
+    # 获取 mlx5_core 驱动模块版本
+    local mlx5_ver
+    mlx5_ver=$(ethtool -i "$(get_mlx5_devs | head -1 | awk '{print $1}')" 2>/dev/null | awk '/^version:/{print $2}')
+    [[ -z "$mlx5_ver" ]] && mlx5_ver=$(modinfo mlx5_core 2>/dev/null | awk '/^version:/{print $2}')
+    print_val "mlx5_core 驱动版本" "${mlx5_ver:-N/A}"
 
     echo ""
     while read -r dev pci nic_type; do
@@ -386,21 +391,42 @@ collect_routes() {
 collect_pcie_config() {
     log_header "7. PCIe 配置"
 
+    # 全局 ACS 状态检测
+    echo -e "  ${BOLD}系统 ACS 状态:${NC}"
+    local acs_on=0 acs_off=0
+    while IFS= read -r acs_line; do
+        if echo "$acs_line" | grep -q "SrcValid+"; then
+            ((acs_on++))
+        elif echo "$acs_line" | grep -q "SrcValid-"; then
+            ((acs_off++))
+        fi
+    done < <(lspci -vvv -nnn 2>/dev/null | grep -i "ACSCtl:")
+    print_val "ACS 开启设备数" "$acs_on"
+    print_val "ACS 关闭设备数" "$acs_off"
+    if [[ $acs_on -eq 0 && $acs_off -gt 0 ]]; then
+        print_val "ACS 全局状态" "off (所有设备 SrcValid-)"
+    elif [[ $acs_on -gt 0 && $acs_off -eq 0 ]]; then
+        print_val "ACS 全局状态" "on (所有设备 SrcValid+)"
+    else
+        print_val "ACS 全局状态" "mixed (部分开启部分关闭)"
+    fi
+
+    echo ""
     while read -r dev pci nic_type; do
         log_section "$dev ($pci) [$nic_type]"
 
         local pcie_vvv=$(lspci -vvv -s "$pci" 2>/dev/null)
 
-        # ACS
+        # ACS (设备级)
         local acs_ctl=$(echo "$pcie_vvv" | grep "ACSCtl:")
         if [[ -n "$acs_ctl" ]]; then
             if echo "$acs_ctl" | grep -q "SrcValid+"; then
-                print_val "ACS" "on"
+                print_val "ACS (设备)" "on (SrcValid+)"
             else
-                print_val "ACS" "off"
+                print_val "ACS (设备)" "off (SrcValid-)"
             fi
         else
-            print_val "ACS" "N/A" "设备不支持或无法读取"
+            print_val "ACS (设备)" "N/A" "设备不支持或无法读取"
         fi
 
         # MaxReadReq
@@ -731,16 +757,32 @@ collect_cc_config() {
 
             # CC 生效模式 (per-IP / per-QP)
             echo -e "  ${BOLD}CC 生效模式:${NC}"
+            # 通过 ROCE_CC_SHAPER_COALESCE_P1 判断
+            local shaper_p1=$(mlxreg -d "$pci" --reg_name ROCE_CC_SHAPER_COALESCE_P1 --get 2>/dev/null)
+            if [[ -n "$shaper_p1" ]]; then
+                local shaper_val=$(echo "$shaper_p1" | grep -oP '0x[0-9a-fA-F]+' | tail -1)
+                case "$shaper_val" in
+                    "0x00000000")
+                        print_val "CC 生效模式" "Per-IP" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_val"
+                        ;;
+                    "0x00000002")
+                        print_val "CC 生效模式" "Per-QP" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_val"
+                        ;;
+                    *)
+                        print_val "CC 生效模式" "未知 ($shaper_val)" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_val"
+                        ;;
+                esac
+            else
+                print_val "CC 生效模式" "N/A" "ROCE_CC_SHAPER_COALESCE_P1 寄存器不可读"
+            fi
+            # 备选: ROCE_ACCL 中的 per-IP 字段
             local accl_cc=$(mlxreg -d "$pci" --reg_name ROCE_ACCL --get 2>/dev/null)
             if [[ -n "$accl_cc" ]]; then
-                # 检查 ROCE_ACCL 中的 per-IP 相关字段
                 local per_ip=$(echo "$accl_cc" | grep -iE "per_ip|per_flow" | awk '{print $NF}')
                 if [[ -n "$per_ip" ]]; then
-                    print_val "Per-IP CC" \
+                    print_val "Per-IP CC (ROCE_ACCL)" \
                         "$([ "$per_ip" = "0x00000001" ] && echo enable || echo disable)" \
                         "roce_cc_per_ip=$per_ip"
-                else
-                    print_val "Per-IP CC (ROCE_ACCL)" "N/A" "寄存器中无 per_ip 字段"
                 fi
             fi
             # mlxconfig 中的 per-IP / flow-label 配置
