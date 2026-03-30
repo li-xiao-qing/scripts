@@ -12,12 +12,12 @@
 set -uo pipefail
 
 # ======================== 颜色 & 常量 ========================
-CYAN='\033[0;36m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-BOLD='\033[1m'
-NC='\033[0m'
+CYAN=$'\e[0;36m'
+BLUE=$'\e[0;34m'
+YELLOW=$'\e[1;33m'
+RED=$'\e[0;31m'
+BOLD=$'\e[1m'
+NC=$'\e[0m'
 
 REPORT_FILE="nic_config_report_$(hostname)_$(date +%Y%m%d_%H%M%S).txt"
 
@@ -92,6 +92,112 @@ is_bond_slave() {
     return 1
 }
 
+# ======================== 辅助: 推断网络用途 ========================
+# 根据IP段、MTU、路由配置等特征推断网卡用途
+# 输出: management | storage | compute | unknown
+infer_nic_usage() {
+    local bond="$1"
+    local slaves="$2"
+    local nic_type="$3"
+
+    local usage="unknown"
+    local reason=""
+
+    # 获取Bond的IP地址
+    local ip_info=$(ip addr show "$bond" 2>/dev/null | grep "inet " | head -1)
+    local ip_addr=$(echo "$ip_info" | awk '{print $2}')
+    local mtu=$(cat "/sys/class/net/$bond/mtu" 2>/dev/null)
+
+    # 特征1: 默认网关所在接口 -> 管理网
+    local default_gw_iface=$(ip route 2>/dev/null | grep "^default" | awk '{print $5}' | head -1)
+    if [[ "$bond" == "$default_gw_iface" ]]; then
+        usage="management"
+        reason="默认网关接口"
+    fi
+
+    # 特征2: MTU=1500 且其他接口是4200 -> 可能是管理网
+    if [[ "$usage" == "unknown" && "$mtu" == "1500" ]]; then
+        local has_large_mtu=false
+        for other_bond in /sys/class/net/bond*; do
+            [[ -d "$other_bond" ]] || continue
+            local other_name=$(basename "$other_bond")
+            [[ "$other_name" == "$bond" ]] && continue
+            local other_mtu=$(cat "$other_bond/mtu" 2>/dev/null)
+            [[ "$other_mtu" == "4200" ]] && { has_large_mtu=true; break; }
+        done
+        if $has_large_mtu; then
+            usage="management"
+            reason="MTU=1500(其他接口4200)"
+        fi
+    fi
+
+    # 特征3: 根据IP段推断
+    if [[ "$usage" == "unknown" && -n "$ip_addr" ]]; then
+        local ip_prefix=$(echo "$ip_addr" | cut -d'.' -f1-2)
+        case "$ip_prefix" in
+            "10.36"|"10.37"|"10.38"|"10.39")
+                usage="management"
+                reason="IP段${ip_prefix}常见于管理网"
+                ;;
+            "11.5"|"11.6"|"11.7"|"11.8")
+                # 11.5.x.x 可能是存储或计算，需要进一步区分
+                local ip_third=$(echo "$ip_addr" | cut -d'.' -f3)
+                if [[ $ip_third -lt 128 ]]; then
+                    usage="storage"
+                    reason="IP段${ip_prefix}.${ip_third}可能是存储网(低段)"
+                else
+                    usage="compute"
+                    reason="IP段${ip_prefix}.${ip_third}可能是计算网(高段)"
+                fi
+                ;;
+            "192.168"|"172.16"|"172.17"|"172.18"|"172.19"|"172.20"|"172.21"|"172.22"|"172.23"|"172.24"|"172.25"|"172.26"|"172.27"|"172.28"|"172.29"|"172.30"|"172.31")
+                usage="management"
+                reason="私网IP段常见于管理网"
+                ;;
+        esac
+    fi
+
+    # 特征4: 根据QoS Trust Mode推断
+    local first_slave=$(echo "$slaves" | awk '{print $1}')
+    if [[ -n "$first_slave" ]] && command -v mlnx_qos &>/dev/null; then
+        local trust_mode=$(mlnx_qos -i "$first_slave" 2>/dev/null | grep -i "trust state" | awk '{print $NF}')
+        if [[ "$trust_mode" == "pcp" && "$usage" == "unknown" ]]; then
+            usage="management"
+            reason="Trust Mode=pcp(其他接口dscp)"
+        elif [[ "$trust_mode" == "dscp" && "$usage" == "unknown" ]]; then
+            usage="compute"
+            reason="Trust Mode=dscp(数据中心标准)"
+        fi
+    fi
+
+    # 特征5: 根据网卡类型推断 (CX6更可能是管理网)
+    if [[ "$usage" == "unknown" && "$nic_type" == "CX6" ]]; then
+        # 如果只有一个CX6，很可能是管理网
+        local cx6_count=0
+        while IFS='|' read -r bname mode_num s slave_pcis slave_types; do
+            local st=$(echo "$slave_types" | cut -d',' -f1)
+            [[ "$st" == "CX6" ]] && ((cx6_count++))
+        done < <(get_bond_info)
+        if [[ $cx6_count -eq 1 ]]; then
+            usage="management"
+            reason="唯一CX6网卡"
+        fi
+    fi
+
+    echo "$usage|$reason"
+}
+
+# 获取Bond的简要用途描述
+get_usage_label() {
+    local usage="$1"
+    case "$usage" in
+        "management") echo "管理网" ;;
+        "storage") echo "存储网" ;;
+        "compute") echo "计算网" ;;
+        *) echo "未知" ;;
+    esac
+}
+
 # 检测网卡物理位置: 机头 (OCP/Mezz 卡) / 机尾 (PCIe add-in 卡)
 # 检测方法 (按优先级):
 #   1. lspci Subsystem 关键词 (OCP / Mezz / Mezzanine)
@@ -143,6 +249,39 @@ detect_position() {
     echo "机尾"
 }
 
+# ======================== 辅助: 获取 Bond 信息 ========================
+# 输出格式: bond_name mode slaves slave_pcis slave_types
+get_bond_info() {
+    for bond_dir in /sys/class/net/bond*; do
+        [[ -d "$bond_dir" ]] || continue
+        local bname=$(basename "$bond_dir")
+        local slaves=$(cat "$bond_dir/bonding/slaves" 2>/dev/null)
+        local mode_str=$(cat "$bond_dir/bonding/mode" 2>/dev/null)
+        local mode_num=$(echo "$mode_str" | awk '{print $2}')
+
+        # 收集 slave 的 PCI 和网卡类型
+        local slave_pcis=""
+        local slave_types=""
+        for slave in $slaves; do
+            local slave_pci=$(ethtool -i "$slave" 2>/dev/null | awk '/bus-info/{print $2}')
+            local slave_type="unknown"
+            if [[ -n "$slave_pci" ]]; then
+                local desc=$(lspci -s "$slave_pci" 2>/dev/null)
+                echo "$desc" | grep -qi "ConnectX-6" && slave_type="CX6"
+                echo "$desc" | grep -qi "ConnectX-7" && slave_type="CX7"
+                echo "$desc" | grep -qi "BlueField-3" && slave_type="BF3"
+            fi
+            slave_pcis="${slave_pcis}${slave_pci},"
+            slave_types="${slave_types}${slave_type},"
+        done
+        # 去掉末尾逗号
+        slave_pcis="${slave_pcis%,}"
+        slave_types="${slave_types%,}"
+
+        echo "$bname|$mode_num|$slaves|$slave_pcis|$slave_types"
+    done
+}
+
 # ======================== 0. 设备发现 ========================
 collect_discovery() {
     log_header "0. 设备发现"
@@ -154,44 +293,93 @@ collect_discovery() {
         echo "    ibdev2netdev 不可用"
     fi
 
-    echo -e "\n  ${BOLD}Bond 接口:${NC}"
-    local found_bond=false
-    for bond in /sys/class/net/bond*; do
-        [[ -d "$bond" ]] || continue
-        found_bond=true
-        local bname=$(basename "$bond")
-        local slaves=$(cat "$bond/bonding/slaves" 2>/dev/null)
-        local mode=$(cat "$bond/bonding/mode" 2>/dev/null)
-        echo "    $bname  mode=$mode  slaves=[$slaves]"
+    # 检测是否存在 Bond 配置
+    local has_bond=false
+    local bond_count=0
+    for bond_dir in /sys/class/net/bond*; do
+        [[ -d "$bond_dir" ]] && { has_bond=true; ((bond_count++)); }
     done
-    $found_bond || echo "    未发现 Bond 接口"
 
-    echo -e "\n  ${BOLD}检测到的 Mellanox/NVIDIA 网卡:${NC}"
-    local front_devs=() rear_devs=()
-    while read -r dev pci nic_type; do
-        local pos=$(detect_position "$pci")
-        local role=""
-        is_bond_slave "$dev" && role="(bond slave)"
-        printf "    %-14s %-15s %-8s %-4s %s\n" "$dev" "$pci" "$nic_type" "$pos" "$role"
-        if [[ "$pos" == "机头" ]]; then
-            front_devs+=("$dev ($nic_type, $pci)")
+    if $has_bond; then
+        echo -e "\n  ${BOLD}Bond 接口 (共 ${bond_count} 个):${NC}"
+        while IFS='|' read -r bname mode_num slaves slave_pcis slave_types; do
+            echo ""
+            # 推断用途
+            local first_type=$(echo "$slave_types" | cut -d',' -f1)
+            local usage_info=$(infer_nic_usage "$bname" "$slaves" "$first_type")
+            local usage=$(echo "$usage_info" | cut -d'|' -f1)
+            local reason=$(echo "$usage_info" | cut -d'|' -f2)
+            local usage_label=$(get_usage_label "$usage")
+
+            if [[ "$usage" != "unknown" ]]; then
+                echo "    ${BOLD}$bname${NC} (mode=$mode_num) [${YELLOW}$usage_label${NC}] ${YELLOW}($reason)${NC}"
+            else
+                echo "    ${BOLD}$bname${NC} (mode=$mode_num)"
+            fi
+            echo "      Slaves: $slaves"
+            # 显示每个 slave 的详细信息
+            local i=0
+            for slave in $slaves; do
+                local slave_pci=$(echo "$slave_pcis" | cut -d',' -f$((i+1)))
+                local slave_type=$(echo "$slave_types" | cut -d',' -f$((i+1)))
+                local pos=$(detect_position "$slave_pci")
+                printf "      └─ %-8s PCI=%-15s Type=%-4s Position=%s\n" "$slave" "$slave_pci" "$slave_type" "$pos"
+                ((i++))
+            done
+        done < <(get_bond_info)
+
+        echo -e "\n  ${BOLD}Bond 与 RDMA 设备关联:${NC}"
+        while IFS='|' read -r bname mode_num slaves slave_pcis slave_types; do
+            for slave in $slaves; do
+                if command -v ibdev2netdev &>/dev/null; then
+                    local ibdev=$(ibdev2netdev 2>/dev/null | grep "^mlx5_" | while read -r line; do
+                        local ib_dev=$(echo "$line" | awk '{print $1}')
+                        local ib_netdev=$(echo "$line" | awk '{print $5}')
+                        [[ "$ib_netdev" == "$slave" ]] && echo "$ib_dev"
+                    done)
+                    [[ -n "$ibdev" ]] && echo "    $bname → $slave → $ibdev"
+                fi
+            done
+        done < <(get_bond_info)
+
+        echo -e "\n  ${BOLD}独立网卡 (未加入 Bond):${NC}"
+        local has_standalone=false
+        while read -r dev pci nic_type; do
+            is_bond_slave "$dev" && continue
+            has_standalone=true
+            local pos=$(detect_position "$pci")
+            printf "    %-14s %-15s %-8s %-4s\n" "$dev" "$pci" "$nic_type" "$pos"
+        done < <(get_mlx5_devs)
+        $has_standalone || echo "    无 (所有网卡均已加入 Bond)"
+    else
+        echo -e "\n  ${BOLD}Bond 接口:${NC}"
+        echo "    未发现 Bond 接口"
+
+        echo -e "\n  ${BOLD}检测到的 Mellanox/NVIDIA 网卡:${NC}"
+        local front_devs=() rear_devs=()
+        while read -r dev pci nic_type; do
+            local pos=$(detect_position "$pci")
+            printf "    %-14s %-15s %-8s %-4s\n" "$dev" "$pci" "$nic_type" "$pos"
+            if [[ "$pos" == "机头" ]]; then
+                front_devs+=("$dev ($nic_type, $pci)")
+            else
+                rear_devs+=("$dev ($nic_type, $pci)")
+            fi
+        done < <(get_mlx5_devs)
+
+        echo -e "\n  ${BOLD}机头网卡 (OCP/Mezz):${NC}"
+        if [[ ${#front_devs[@]} -gt 0 ]]; then
+            for d in "${front_devs[@]}"; do echo "    $d"; done
         else
-            rear_devs+=("$dev ($nic_type, $pci)")
+            echo "    无 (或无法自动识别, 请结合 Part Number 人工确认)"
         fi
-    done < <(get_mlx5_devs)
 
-    echo -e "\n  ${BOLD}机头网卡 (OCP/Mezz):${NC}"
-    if [[ ${#front_devs[@]} -gt 0 ]]; then
-        for d in "${front_devs[@]}"; do echo "    $d"; done
-    else
-        echo "    无 (或无法自动识别, 请结合 Part Number 人工确认)"
-    fi
-
-    echo -e "  ${BOLD}机尾网卡 (PCIe add-in):${NC}"
-    if [[ ${#rear_devs[@]} -gt 0 ]]; then
-        for d in "${rear_devs[@]}"; do echo "    $d"; done
-    else
-        echo "    无"
+        echo -e "  ${BOLD}机尾网卡 (PCIe add-in):${NC}"
+        if [[ ${#rear_devs[@]} -gt 0 ]]; then
+            for d in "${rear_devs[@]}"; do echo "    $d"; done
+        else
+            echo "    无"
+        fi
     fi
 }
 
@@ -209,30 +397,112 @@ collect_driver_firmware() {
     [[ -z "$mlx5_ver" ]] && mlx5_ver=$(modinfo mlx5_core 2>/dev/null | awk '/^version:/{print $2}')
     print_val "mlx5_core 驱动版本" "${mlx5_ver:-N/A}"
 
-    echo ""
-    while read -r dev pci nic_type; do
-        local fw=$(ethtool -i "$dev" 2>/dev/null | awk '/firmware-version/{print $2}')
+    # 检测是否存在 Bond 配置
+    local has_bond=false
+    for bond_dir in /sys/class/net/bond*; do
+        [[ -d "$bond_dir" ]] && { has_bond=true; break; }
+    done
 
-        # 检测网卡形态: Mezz Bridge (OCP) / PCIe Add-in
-        local form_factor="PCIe"
-        local lspci_detail=$(lspci -vvv -s "$pci" 2>/dev/null)
-        local subsys=$(echo "$lspci_detail" | grep -i "Subsystem:")
-        if echo "$subsys" | grep -qiE "OCP|Mezz|Mezzanine|Bridge"; then
-            form_factor="Mezz Bridge"
-        fi
-        # 辅助判断: 获取 Part Number
-        local pn=""
-        if command -v mlxfwmanager &>/dev/null; then
-            pn=$(mlxfwmanager -d "$pci" --query 2>/dev/null \
-                | grep -i "Part Number" | head -1 | sed 's/.*://;s/^[ \t]*//')
-            # Mezz/OCP 卡 Part Number 通常含 MCX75xxxx-Hxxx 等模式
-            if [[ -n "$pn" ]] && echo "$pn" | grep -qiE "\-H[A-Z]|\-O[A-Z]|OCP|MEZZ"; then
+    if $has_bond; then
+        echo -e "\n  ${BOLD}Bond 接口固件信息:${NC}"
+        while IFS='|' read -r bname mode_num slaves slave_pcis slave_types; do
+            echo ""
+            # 获取第一个 slave 的固件版本作为代表
+            local first_slave=$(echo "$slaves" | awk '{print $1}')
+            local first_pci=$(echo "$slave_pcis" | cut -d',' -f1)
+            local first_type=$(echo "$slave_types" | cut -d',' -f1)
+            local fw=$(ethtool -i "$first_slave" 2>/dev/null | awk '/firmware-version/{print $2}')
+
+            # 检测网卡形态
+            local form_factor="PCIe"
+            local lspci_detail=$(lspci -vvv -s "$first_pci" 2>/dev/null)
+            local subsys=$(echo "$lspci_detail" | grep -i "Subsystem:")
+            if echo "$subsys" | grep -qiE "OCP|Mezz|Mezzanine|Bridge"; then
                 form_factor="Mezz Bridge"
             fi
-        fi
 
-        print_val "固件 $dev" "${fw:-N/A}" "$nic_type $form_factor $pci${pn:+ PN:$pn}"
-    done < <(get_mlx5_devs)
+            # 获取 Part Number
+            local pn=""
+            if command -v mlxfwmanager &>/dev/null; then
+                pn=$(mlxfwmanager -d "$first_pci" --query 2>/dev/null \
+                    | grep -i "Part Number" | head -1 | sed 's/.*://;s/^[ \t]*//')
+                if [[ -n "$pn" ]] && echo "$pn" | grep -qiE "\-H[A-Z]|\-O[A-Z]|OCP|MEZZ"; then
+                    form_factor="Mezz Bridge"
+                fi
+            fi
+
+            echo "    ${BOLD}$bname${NC} (mode=$mode_num)"
+            printf "      Slaves: %s\n" "$slaves"
+            printf "      固件版本: %-20s Type: %-4s Form: %s\n" "${fw:-N/A}" "$first_type" "$form_factor"
+            [[ -n "$pn" ]] && printf "      Part Number: %s\n" "$pn"
+
+            # 如果 slaves 有多个，检查固件版本是否一致
+            local slave_count=$(echo "$slaves" | wc -w)
+            if [[ $slave_count -gt 1 ]]; then
+                local fw_mismatch=false
+                local fw_list=""
+                for slave in $slaves; do
+                    local slave_fw=$(ethtool -i "$slave" 2>/dev/null | awk '/firmware-version/{print $2}')
+                    fw_list="${fw_list}${slave}=${slave_fw} "
+                    [[ "$slave_fw" != "$fw" ]] && fw_mismatch=true
+                done
+                if $fw_mismatch; then
+                    echo -e "      ${YELLOW}警告: Slave 固件版本不一致!${NC}"
+                    echo "        $fw_list"
+                fi
+            fi
+        done < <(get_bond_info)
+
+        echo -e "\n  ${BOLD}独立网卡固件信息 (未加入 Bond):${NC}"
+        local has_standalone=false
+        while read -r dev pci nic_type; do
+            is_bond_slave "$dev" && continue
+            has_standalone=true
+            local fw=$(ethtool -i "$dev" 2>/dev/null | awk '/firmware-version/{print $2}')
+
+            local form_factor="PCIe"
+            local lspci_detail=$(lspci -vvv -s "$pci" 2>/dev/null)
+            local subsys=$(echo "$lspci_detail" | grep -i "Subsystem:")
+            if echo "$subsys" | grep -qiE "OCP|Mezz|Mezzanine|Bridge"; then
+                form_factor="Mezz Bridge"
+            fi
+
+            local pn=""
+            if command -v mlxfwmanager &>/dev/null; then
+                pn=$(mlxfwmanager -d "$pci" --query 2>/dev/null \
+                    | grep -i "Part Number" | head -1 | sed 's/.*://;s/^[ \t]*//')
+                if [[ -n "$pn" ]] && echo "$pn" | grep -qiE "\-H[A-Z]|\-O[A-Z]|OCP|MEZZ"; then
+                    form_factor="Mezz Bridge"
+                fi
+            fi
+
+            print_val "固件 $dev" "${fw:-N/A}" "$nic_type $form_factor $pci${pn:+ PN:$pn}"
+        done < <(get_mlx5_devs)
+        $has_standalone || echo "    无 (所有网卡均已加入 Bond)"
+    else
+        echo ""
+        while read -r dev pci nic_type; do
+            local fw=$(ethtool -i "$dev" 2>/dev/null | awk '/firmware-version/{print $2}')
+
+            local form_factor="PCIe"
+            local lspci_detail=$(lspci -vvv -s "$pci" 2>/dev/null)
+            local subsys=$(echo "$lspci_detail" | grep -i "Subsystem:")
+            if echo "$subsys" | grep -qiE "OCP|Mezz|Mezzanine|Bridge"; then
+                form_factor="Mezz Bridge"
+            fi
+
+            local pn=""
+            if command -v mlxfwmanager &>/dev/null; then
+                pn=$(mlxfwmanager -d "$pci" --query 2>/dev/null \
+                    | grep -i "Part Number" | head -1 | sed 's/.*://;s/^[ \t]*//')
+                if [[ -n "$pn" ]] && echo "$pn" | grep -qiE "\-H[A-Z]|\-O[A-Z]|OCP|MEZZ"; then
+                    form_factor="Mezz Bridge"
+                fi
+            fi
+
+            print_val "固件 $dev" "${fw:-N/A}" "$nic_type $form_factor $pci${pn:+ PN:$pn}"
+        done < <(get_mlx5_devs)
+    fi
 
     if command -v mlxfwmanager &>/dev/null; then
         echo -e "\n  ${BOLD}mlxfwmanager 详情:${NC}"
@@ -249,7 +519,27 @@ collect_bond_config() {
         [[ -d "$bond_dir" ]] || continue
         found=true
         local bname=$(basename "$bond_dir")
-        log_section "$bname"
+
+        # 推断用途
+        local slaves=$(cat "$bond_dir/bonding/slaves" 2>/dev/null)
+        local first_slave=$(echo "$slaves" | awk '{print $1}')
+        local slave_type="unknown"
+        if [[ -n "$first_slave" ]]; then
+            local slave_pci=$(ethtool -i "$first_slave" 2>/dev/null | awk '/bus-info/{print $2}')
+            local desc=$(lspci -s "$slave_pci" 2>/dev/null)
+            echo "$desc" | grep -qi "ConnectX-6" && slave_type="CX6"
+            echo "$desc" | grep -qi "BlueField-3" && slave_type="BF3"
+        fi
+        local usage_info=$(infer_nic_usage "$bname" "$slaves" "$slave_type")
+        local usage=$(echo "$usage_info" | cut -d'|' -f1)
+        local reason=$(echo "$usage_info" | cut -d'|' -f2)
+        local usage_label=$(get_usage_label "$usage")
+
+        if [[ "$usage" != "unknown" ]]; then
+            log_section "$bname [${usage_label}] (${reason})"
+        else
+            log_section "$bname"
+        fi
 
         local mode_str=$(cat "$bond_dir/bonding/mode" 2>/dev/null)
         local mode_num=$(echo "$mode_str" | awk '{print $2}')
@@ -291,9 +581,15 @@ collect_bond_config() {
         print_val "MII downdelay" "${downdelay:-0}"
 
         # LAG Port Select Mode (mlxconfig on first slave)
-        local slaves=$(cat "$bond_dir/bonding/slaves" 2>/dev/null)
         print_val "Slaves" "${slaves:-无}"
-        local first_slave=$(echo "$slaves" | awk '{print $1}')
+
+        # 显示IP地址信息
+        local ip_addrs=$(ip addr show "$bname" 2>/dev/null | grep "inet " | awk '{print $2}' | tr '\n' ' ')
+        [[ -n "$ip_addrs" ]] && print_val "IP 地址" "$ip_addrs"
+
+        # 显示MTU
+        local mtu=$(cat "$bond_dir/mtu" 2>/dev/null)
+        print_val "MTU" "${mtu:-N/A}"
         if [[ -n "$first_slave" ]] && command -v mlxconfig &>/dev/null; then
             local slave_pci=$(ethtool -i "$first_slave" 2>/dev/null | awk '/bus-info/{print $2}')
             if [[ -n "$slave_pci" ]]; then
