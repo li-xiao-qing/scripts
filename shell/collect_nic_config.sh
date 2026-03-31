@@ -580,7 +580,6 @@ collect_bond_config() {
         print_val "MII updelay" "${updelay:-0}"
         print_val "MII downdelay" "${downdelay:-0}"
 
-        # LAG Port Select Mode (mlxconfig on first slave)
         print_val "Slaves" "${slaves:-无}"
 
         # 显示IP地址信息
@@ -590,13 +589,25 @@ collect_bond_config() {
         # 显示MTU
         local mtu=$(cat "$bond_dir/mtu" 2>/dev/null)
         print_val "MTU" "${mtu:-N/A}"
-        if [[ -n "$first_slave" ]] && command -v mlxconfig &>/dev/null; then
-            local slave_pci=$(ethtool -i "$first_slave" 2>/dev/null | awk '/bus-info/{print $2}')
-            if [[ -n "$slave_pci" ]]; then
-                local lag_mode=$(mlxconfig -d "$slave_pci" q 2>/dev/null | grep -i "LAG_PORT_SELECT" | awk '{print $NF}')
-                print_val "LAG Port Select Mode" "${lag_mode:-N/A}"
+
+        # LAG Port Select Mode (展示 bond->slave->lag_port_select_mode 映射关系)
+        echo ""
+        echo -e "  ${BOLD}LAG Port Select Mode:${NC}"
+        for slave in $slaves; do
+            local lag_mode=$(cat "/sys/class/net/$slave/compat/devlink/lag_port_select_mode" 2>/dev/null)
+            if [[ -n "$lag_mode" ]]; then
+                printf "    %-8s -> %s\n" "$slave" "$lag_mode"
+            else
+                # 回退到 mlxconfig 方式
+                local slave_pci=$(ethtool -i "$slave" 2>/dev/null | awk '/bus-info/{print $2}')
+                if [[ -n "$slave_pci" ]] && command -v mlxconfig &>/dev/null; then
+                    lag_mode=$(mlxconfig -d "$slave_pci" q 2>/dev/null | grep -i "LAG_PORT_SELECT" | awk '{print $NF}')
+                    printf "    %-8s -> %-10s (via mlxconfig)\n" "$slave" "${lag_mode:-N/A}"
+                else
+                    printf "    %-8s -> N/A\n" "$slave"
+                fi
             fi
-        fi
+        done
     done
     $found || echo "  未发现 Bond 接口"
 }
@@ -617,8 +628,68 @@ collect_kernel_params() {
     echo ""
     local rp_all=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)
     local rp_def=$(sysctl -n net.ipv4.conf.default.rp_filter 2>/dev/null)
-    print_val "RP Filter (all)" "${rp_all:-N/A}"
-    print_val "RP Filter (default)" "${rp_def:-N/A}"
+    print_val "RP Filter (all)" "${rp_all:-N/A}" "全局默认值"
+    print_val "RP Filter (default)" "${rp_def:-N/A}" "新接口默认值"
+
+    # RP Filter 模式说明
+    echo -e "  ${BOLD}RP Filter 模式说明:${NC} 0=关闭 1=严格模式 2=宽松模式(RDMA推荐)"
+
+    # 查询每个网卡的 RP Filter
+    echo -e "  ${BOLD}各接口 RP Filter 配置 (生效值):${NC}"
+
+    # Bond 接口
+    local has_bond=false
+    for bond_dir in /sys/class/net/bond*; do
+        [[ -d "$bond_dir" ]] || continue
+        has_bond=true
+        local bname=$(basename "$bond_dir")
+        local rp_val=$(cat "/proc/sys/net/ipv4/conf/$bname/rp_filter" 2>/dev/null)
+        local rp_note=""
+        case "${rp_val:-N/A}" in
+            "0") rp_note="关闭" ;;
+            "1") rp_note="严格模式-可能丢包!" ;;
+            "2") rp_note="宽松模式-RDMA推荐" ;;
+        esac
+        printf "    %-12s : %-4s  %s\n" "$bname" "${rp_val:-N/A}" "$rp_note"
+    done
+
+    # 物理网卡 (mlx5)
+    while read -r dev pci nic_type; do
+        local rp_val=$(cat "/proc/sys/net/ipv4/conf/$dev/rp_filter" 2>/dev/null)
+        local rp_note=""
+        case "${rp_val:-N/A}" in
+            "0") rp_note="关闭" ;;
+            "1") rp_note="严格模式-可能丢包!" ;;
+            "2") rp_note="宽松模式-RDMA推荐" ;;
+        esac
+        printf "    %-12s : %-4s  %s\n" "$dev" "${rp_val:-N/A}" "$rp_note"
+    done < <(get_mlx5_devs)
+
+    # 检查是否有潜在问题 (RP Filter=1 且是RDMA网卡)
+    echo ""
+    local rp_issues=""
+    while read -r dev pci nic_type; do
+        local rp_val=$(cat "/proc/sys/net/ipv4/conf/$dev/rp_filter" 2>/dev/null)
+        if [[ "$rp_val" == "1" ]]; then
+            rp_issues="${rp_issues}$dev "
+        fi
+    done < <(get_mlx5_devs)
+
+    # 也检查 bond 接口
+    for bond_dir in /sys/class/net/bond*; do
+        [[ -d "$bond_dir" ]] || continue
+        local bname=$(basename "$bond_dir")
+        local rp_val=$(cat "/proc/sys/net/ipv4/conf/$bname/rp_filter" 2>/dev/null)
+        if [[ "$rp_val" == "1" ]]; then
+            rp_issues="${rp_issues}$bname "
+        fi
+    done
+
+    if [[ -n "$rp_issues" ]]; then
+        echo -e "  ${YELLOW}警告: 以下接口 RP Filter=1 (严格模式), 可能导致RDMA丢包:${NC}"
+        echo "    $rp_issues"
+        echo -e "  ${YELLOW}建议: 对于RDMA网卡, 建议设置为 2 (宽松模式) 或 0 (关闭)${NC}"
+    fi
 }
 
 # ======================== 4. 网卡硬件配置 ========================
@@ -1053,41 +1124,75 @@ collect_cc_config() {
 
             # CC 生效模式 (per-IP / per-QP)
             echo -e "  ${BOLD}CC 生效模式:${NC}"
-            # 通过 ROCE_CC_SHAPER_COALESCE_P1 判断
-            local shaper_p1=$(mlxreg -d "$pci" --reg_name ROCE_CC_SHAPER_COALESCE_P1 --get 2>/dev/null)
+            # 通过 mlxconfig -d <pci> -e q ROCE_CC_SHAPER_COALESCE_P1 判断
+            # Current = 0 是 PerIP 模式, = 2 是 PerQP 模式
+            # 0 = Per-IP (按源IP聚合拥塞控制)
+            # 2 = Per-QP (按队列对独立拥塞控制)
+            local shaper_p1=$(mlxconfig -d "$pci" -e q ROCE_CC_SHAPER_COALESCE_P1 2>/dev/null)
             if [[ -n "$shaper_p1" ]]; then
-                local shaper_val=$(echo "$shaper_p1" | grep -oP '0x[0-9a-fA-F]+' | tail -1)
+                # 解析 mlxconfig -e 输出格式:
+                # 格式1: "Current: 0 (DEVICE_DEFAULT)" 或 "Current: 2 (DEVICE_DEFAULT)"
+                # 格式2: "Current: 0" 或 "Current: 2"
+                # 格式3: "Current: DEVICE_DEFAULT(0)" 或 "Current: DEVICE_DEFAULT(2)"
+                local shaper_val=""
+                if echo "$shaper_p1" | grep -q "Current"; then
+                    # 尝试提取纯数字值
+                    shaper_val=$(echo "$shaper_p1" | grep -i "Current" | grep -oP '\d+' | head -1)
+                    # 如果没提取到数字,尝试提取括号内的值
+                    if [[ -z "$shaper_val" ]]; then
+                        shaper_val=$(echo "$shaper_p1" | grep -i "Current" | grep -oP '\(\K\d+' | head -1)
+                    fi
+                fi
+
                 case "$shaper_val" in
-                    "0x00000000")
-                        print_val "CC 生效模式" "Per-IP" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_val"
+                    "0")
+                        print_val "CC 生效模式" "Per-IP" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_val (0=PerIP, 2=PerQP)"
                         ;;
-                    "0x00000002")
-                        print_val "CC 生效模式" "Per-QP" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_val"
+                    "2")
+                        print_val "CC 生效模式" "Per-QP" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_val (0=PerIP, 2=PerQP)"
+                        ;;
+                    "")
+                        # 未提取到值,回退到 mlxreg 方式
+                        local shaper_reg=$(mlxreg -d "$pci" --reg_name ROCE_CC_SHAPER_COALESCE_P1 --get 2>/dev/null)
+                        if [[ -n "$shaper_reg" ]]; then
+                            local shaper_hex=$(echo "$shaper_reg" | grep -oP '0x[0-9a-fA-F]+' | tail -1)
+                            case "$shaper_hex" in
+                                "0x00000000")
+                                    print_val "CC 生效模式" "Per-IP" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_hex (0=PerIP, 2=PerQP, via mlxreg)"
+                                    ;;
+                                "0x00000002")
+                                    print_val "CC 生效模式" "Per-QP" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_hex (0=PerIP, 2=PerQP, via mlxreg)"
+                                    ;;
+                                *)
+                                    print_val "CC 生效模式" "未知 ($shaper_hex)" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_hex (0=PerIP, 2=PerQP, via mlxreg)"
+                                    ;;
+                            esac
+                        else
+                            print_val "CC 生效模式" "N/A" "无法读取 ROCE_CC_SHAPER_COALESCE_P1"
+                        fi
                         ;;
                     *)
-                        print_val "CC 生效模式" "未知 ($shaper_val)" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_val"
+                        print_val "CC 生效模式" "未知 ($shaper_val)" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_val (期望 0=PerIP 或 2=PerQP)"
                         ;;
                 esac
             else
-                print_val "CC 生效模式" "N/A" "ROCE_CC_SHAPER_COALESCE_P1 寄存器不可读"
-            fi
-            # 备选: ROCE_ACCL 中的 per-IP 字段
-            local accl_cc=$(mlxreg -d "$pci" --reg_name ROCE_ACCL --get 2>/dev/null)
-            if [[ -n "$accl_cc" ]]; then
-                local per_ip=$(echo "$accl_cc" | grep -iE "per_ip|per_flow" | awk '{print $NF}')
-                if [[ -n "$per_ip" ]]; then
-                    print_val "Per-IP CC (ROCE_ACCL)" \
-                        "$([ "$per_ip" = "0x00000001" ] && echo enable || echo disable)" \
-                        "roce_cc_per_ip=$per_ip"
-                fi
-            fi
-            # mlxconfig 中的 per-IP / flow-label 配置
-            if command -v mlxconfig &>/dev/null; then
-                local perip_cfg=$(echo "$mlx_out" | grep -iE "PER_IP|PER_QP|FLOW_LABEL_CC|CC_MODE")
-                if [[ -n "$perip_cfg" ]]; then
-                    echo "$perip_cfg" | while read -r line; do echo "    $line"; done
+                # 回退到 mlxreg 方式
+                local shaper_reg=$(mlxreg -d "$pci" --reg_name ROCE_CC_SHAPER_COALESCE_P1 --get 2>/dev/null)
+                if [[ -n "$shaper_reg" ]]; then
+                    local shaper_hex=$(echo "$shaper_reg" | grep -oP '0x[0-9a-fA-F]+' | tail -1)
+                    case "$shaper_hex" in
+                        "0x00000000")
+                            print_val "CC 生效模式" "Per-IP" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_hex (0=PerIP, 2=PerQP, via mlxreg)"
+                            ;;
+                        "0x00000002")
+                            print_val "CC 生效模式" "Per-QP" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_hex (0=PerIP, 2=PerQP, via mlxreg)"
+                            ;;
+                        *)
+                            print_val "CC 生效模式" "未知 ($shaper_hex)" "ROCE_CC_SHAPER_COALESCE_P1=$shaper_hex (0=PerIP, 2=PerQP, via mlxreg)"
+                            ;;
+                    esac
                 else
-                    print_val "Per-IP CC (mlxconfig)" "N/A" "未找到相关配置项"
+                    print_val "CC 生效模式" "N/A" "无法读取 ROCE_CC_SHAPER_COALESCE_P1"
                 fi
             fi
         fi
@@ -1101,24 +1206,12 @@ collect_advanced_features() {
     while read -r dev pci nic_type; do
         log_section "$dev ($pci) [$nic_type]"
 
-        # mlxconfig 持久化配置
-        if command -v mlxconfig &>/dev/null; then
-            local mlx_out=$(mlxconfig -d "$pci" q 2>/dev/null)
-            local ar=$(echo "$mlx_out" | grep -i "ADAPTIVE_ROUTING" | awk '{print $NF}')
-            print_val "Adaptive Routing (mlxconfig)" "${ar:-N/A}"
-
-            local adv_items=$(echo "$mlx_out" | grep -iE "SLOW_RESTART|TX_WINDOW|ADP_RETRANS")
-            if [[ -n "$adv_items" ]]; then
-                echo "$adv_items" | while read -r line; do echo "    $line"; done
-            fi
-        fi
-
-        # mlxreg ROCE_ACCL 运行时参数
+        # 使用 mlxreg ROCE_ACCL 寄存器读取运行时参数
         if command -v mlxreg &>/dev/null; then
             local accl=$(mlxreg -d "$pci" --reg_name ROCE_ACCL --get 2>/dev/null)
             if [[ -n "$accl" ]]; then
                 echo -e "  ${BOLD}ROCE_ACCL 运行时参数:${NC}"
-                # 只提取关键字段
+                # 提取关键字段
                 local tx_win=$(echo "$accl" | grep "roce_tx_window_en" | awk '{print $NF}')
                 local slow_r=$(echo "$accl" | grep "roce_slow_restart_en" | grep -v idle | awk '{print $NF}')
                 local slow_idle=$(echo "$accl" | grep "roce_slow_restart_idle_en" | awk '{print $NF}')
