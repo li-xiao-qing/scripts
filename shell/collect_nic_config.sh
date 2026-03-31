@@ -553,15 +553,39 @@ collect_bond_config() {
         print_val "xmit_hash_policy" "${xmit:-N/A}"
 
         # ARP 双发检测
+        # ARP 双发特征：用 tcpdump 抓包时，一个 slave 收到 Request，但两个 slave 都响应 Reply
+        # 检测方法：tcpdump -i <slave> -vv -nn arp | grep "<target_ip>"
         local arp_interval=$(cat "$bond_dir/bonding/arp_interval" 2>/dev/null)
         local arp_targets=$(cat "$bond_dir/bonding/arp_ip_target" 2>/dev/null)
         local arp_validate=$(cat "$bond_dir/bonding/arp_validate" 2>/dev/null | awk '{print $1}')
         local arp_all_targets=$(cat "$bond_dir/bonding/arp_all_targets" 2>/dev/null | awk '{print $1}')
+        
+        echo ""
+        echo -e "  ${BOLD}ARP 双发检测:${NC}"
+        echo "    检测方法: tcpdump -i <slave> -vv -nn arp | grep '<target_ip>'"
+        echo "    双发特征: 一个slave收到Request，两个slave都响应Reply"
+        
         if [[ -n "$arp_interval" && "$arp_interval" -gt 0 ]] 2>/dev/null; then
-            print_val "ARP 双发" "启用" "interval=${arp_interval}ms"
+            print_val "ARP 双发(sysfs)" "启用" "interval=${arp_interval}ms"
         else
-            print_val "ARP 双发" "未启用" "arp_interval=0"
+            print_val "ARP 双发(sysfs)" "未启用/未知" "arp_interval=${arp_interval:-0}"
         fi
+        
+        # 显示检测命令示例
+        local first_slave=$(echo "$slaves" | awk '{print $1}')
+        local second_slave=$(echo "$slaves" | awk '{print $2}')
+        if [[ -n "$first_slave" && -n "$second_slave" ]]; then
+            echo ""
+            echo -e "  ${YELLOW}ARP 双发检测命令示例:${NC}"
+            echo "    # 在两个窗口同时执行，观察是否有双发特征"
+            echo "    tcpdump -i $first_slave -vv -nn arp | grep '<目标IP>'"
+            echo "    tcpdump -i $second_slave -vv -nn arp | grep '<目标IP>'"
+            echo ""
+            echo -e "  ${YELLOW}双发判断标准:${NC}"
+            echo "    ✓ 一个slave收到Request，两个slave都响应Reply → 已启用ARP双发"
+            echo "    ✗ 只有收到Request的slave响应Reply → 未启用ARP双发"
+        fi
+        
         print_val "ARP interval" "${arp_interval:-0}"
         [[ -n "$arp_targets" ]] && print_val "ARP targets" "$arp_targets"
         print_val "ARP validate" "${arp_validate:-N/A}"
