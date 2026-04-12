@@ -139,34 +139,100 @@ get_server_bond_ip() {
 
 #===========================================
 # 获取与IB设备亲和的GPU设备号
-# 参数: ib_dev [remote: 是否远程获取]
-# 返回: GPU index 或空字符串
+# 通过 nvidia-smi/ppu-smi topo -m 解析 PIX 关系
+# 参数: ib_dev [remote]
+# 返回: GPU index（默认0）
 #===========================================
 get_affinity_gpu() {
     local ib_dev=$1
     local remote=$2
 
-    local cmd='
-ib_numa=$(cat /sys/class/infiniband/'"${ib_dev}"'/device/numa_node 2>/dev/null)
-if [ -z "$ib_numa" ]; then exit 1; fi
-gpu_idx=0
-for gpu_dir in /sys/bus/pci/devices/*/; do
-    if [ -d "${gpu_dir}driver" ] && readlink "${gpu_dir}driver" 2>/dev/null | grep -q nvidia; then
-        gpu_numa=$(cat "${gpu_dir}numa_node" 2>/dev/null)
-        if [ "$gpu_numa" = "$ib_numa" ]; then
-            echo $gpu_idx
-            exit 0
-        fi
-        gpu_idx=$((gpu_idx + 1))
-    fi
-done
-echo 0
-'
+    local topo_file
+    topo_file=$(mktemp)
+
     if [ "${remote}" = "remote" ]; then
-        ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} "${cmd}" 2>/dev/null
+        ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+            'if command -v ppu-smi &>/dev/null; then ppu-smi topo -m 2>/dev/null; elif command -v nvidia-smi &>/dev/null; then nvidia-smi topo -m 2>/dev/null; fi' > "${topo_file}"
     else
-        eval "${cmd}"
+        if command -v ppu-smi &>/dev/null; then
+            ppu-smi topo -m > "${topo_file}" 2>/dev/null
+        elif command -v nvidia-smi &>/dev/null; then
+            nvidia-smi topo -m > "${topo_file}" 2>/dev/null
+        fi
     fi
+
+    if [ ! -s "${topo_file}" ]; then
+        rm -f "${topo_file}"
+        echo 0
+        return
+    fi
+
+    # 从 NIC Legend 找到 ib_dev 对应的 NIC 名称
+    local nic_name=""
+    local legend
+    legend=$(sed -n '/NIC Legend/,$p' "${topo_file}")
+    while IFS= read -r line; do
+        if echo "$line" | grep -q "${ib_dev}"; then
+            nic_name=$(echo "$line" | awk -F: '{print $1}' | tr -d ' ')
+            break
+        fi
+    done <<< "$legend"
+
+    if [ -z "$nic_name" ]; then
+        rm -f "${topo_file}"
+        echo 0
+        return
+    fi
+
+    # 从拓扑矩阵找到 NIC 行
+    local nic_row=""
+    while IFS= read -r line; do
+        local first
+        first=$(echo "$line" | awk '{print $1}')
+        if [ "$first" = "$nic_name" ]; then
+            nic_row="$line"
+            break
+        fi
+    done < "${topo_file}"
+
+    if [ -z "$nic_row" ]; then
+        rm -f "${topo_file}"
+        echo 0
+        return
+    fi
+
+    # 找到表头行（第一个包含 GPU/PPU 的非空行）
+    local header_line=""
+    while IFS= read -r line; do
+        if echo "$line" | grep -qiE "(GPU|PPU)[0-9]"; then
+            header_line="$line"
+            break
+        fi
+    done < "${topo_file}"
+
+    rm -f "${topo_file}"
+
+    if [ -z "$header_line" ]; then
+        echo 0
+        return
+    fi
+
+    # 遍历表头列，找第一个与 NIC 是 PIX 关系的 GPU/PPU
+    local col_idx=0
+    for col_name in $header_line; do
+        if echo "$col_name" | grep -qiE "^(GPU|PPU)[0-9]+$"; then
+            local awk_field=$((col_idx + 2))
+            local val
+            val=$(echo "$nic_row" | awk -v c=${awk_field} '{print $c}')
+            if [ "$val" = "PIX" ]; then
+                echo "$col_name" | sed 's/[^0-9]//g'
+                return
+            fi
+        fi
+        col_idx=$((col_idx + 1))
+    done
+
+    echo 0
 }
 
 #===========================================
@@ -175,58 +241,52 @@ echo 0
 # 设置全局变量: LOCAL_GPU_ID, REMOTE_GPU_ID
 #===========================================
 check_gdr() {
-    if ! command -v nvidia-smi &>/dev/null; then
-        echo -e "${RED}[WARN] 本机未找到nvidia-smi，将跳过GDR测试${NC}" >&2
+    local local_smi="" remote_smi=""
+
+    if command -v ppu-smi &>/dev/null; then
+        local_smi="ppu-smi"
+    elif command -v nvidia-smi &>/dev/null; then
+        local_smi="nvidia-smi"
+    else
+        echo -e "${RED}[WARN] 本机未找到nvidia-smi/ppu-smi，将跳过GDR测试${NC}" >&2
         echo "false"; return
     fi
 
     local gpu_count
-    gpu_count=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+    if [ "${local_smi}" = "ppu-smi" ]; then
+        gpu_count=$(ppu-smi -q 2>/dev/null | grep -c "PPU UUID" || echo 0)
+    else
+        gpu_count=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+    fi
     if [ "${gpu_count}" -eq 0 ]; then
-        echo -e "${RED}[WARN] 本机未检测到GPU，将跳过GDR测试${NC}" >&2
+        echo -e "${RED}[WARN] 本机未检测到GPU/PPU，将跳过GDR测试${NC}" >&2
         echo "false"; return
     fi
 
-    ssh ${SSH_OPTS} \
-        ${SERVER_USER}@${SERVER_IP} \
-        "command -v nvidia-smi" &>/dev/null
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}[WARN] server端未找到nvidia-smi，将跳过GDR测试${NC}" >&2
+    remote_smi=$(ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+        'if command -v ppu-smi &>/dev/null; then echo ppu-smi; elif command -v nvidia-smi &>/dev/null; then echo nvidia-smi; fi' 2>/dev/null)
+    if [ -z "${remote_smi}" ]; then
+        echo -e "${RED}[WARN] server端未找到nvidia-smi/ppu-smi，将跳过GDR测试${NC}" >&2
         echo "false"; return
     fi
 
     local server_gpu_count
-    server_gpu_count=$(ssh ${SSH_OPTS} \
-        ${SERVER_USER}@${SERVER_IP} \
-        "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l")
+    if [ "${remote_smi}" = "ppu-smi" ]; then
+        server_gpu_count=$(ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+            "ppu-smi -q 2>/dev/null | grep -c 'PPU UUID' || echo 0" 2>/dev/null)
+    else
+        server_gpu_count=$(ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+            "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l")
+    fi
     if [ "${server_gpu_count}" -eq 0 ]; then
-        echo -e "${RED}[WARN] server端未检测到GPU，将跳过GDR测试${NC}" >&2
+        echo -e "${RED}[WARN] server端未检测到GPU/PPU，将跳过GDR测试${NC}" >&2
         echo "false"; return
     fi
 
-    # 检查本机 GDR 内核模块
-    if ! lsmod | grep -qE "nv_peer_mem|nvidia_peermem"; then
-        echo -e "${RED}[WARN] 本机未加载nv_peer_mem/nvidia_peermem模块，将跳过GDR测试${NC}" >&2
-        echo "false"; return
-    fi
-
-    # 检查server端 GDR 内核模块
-    local server_peermem
-    server_peermem=$(ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
-        "lsmod | grep -cE 'nv_peer_mem|nvidia_peermem'" 2>/dev/null)
-    if [ "${server_peermem:-0}" -eq 0 ]; then
-        echo -e "${RED}[WARN] server端未加载nv_peer_mem/nvidia_peermem模块，将跳过GDR测试${NC}" >&2
-        echo "false"; return
-    fi
-
-    # 检查 perftest 是否支持 --use_cuda
     if ! ${IB_TOOL} --help 2>&1 | grep -q "use_cuda"; then
         echo -e "${RED}[WARN] 本机perftest未编译CUDA支持，将跳过GDR测试${NC}" >&2
         echo "false"; return
     fi
-
-    LOCAL_GPU_ID=$(get_affinity_gpu "${IB_DEV}")
-    REMOTE_GPU_ID=$(get_affinity_gpu "${IB_DEV}" "remote")
 
     echo "true"
 }
@@ -545,6 +605,7 @@ run_test_group() {
         start_server ${qp} "${bidir}" "${use_cuda}" "${use_cm}"
 
         if ! verify_server ${qp}; then
+            printf "\r\033[2K" >&2
             echo -e "${RED}  [${idx}/${total}] QP=${qp} server启动失败，跳过${NC}" >&2
             bw_values+=("ERR")
             kill_server
@@ -556,10 +617,11 @@ run_test_group() {
         kill_server
 
         bw_values+=("${bw}")
+        printf "\r\033[2K" >&2
         if [ "${bw}" = "TIMEOUT" ] || [ "${bw}" = "N/A" ] || [ "${bw}" = "ERR" ]; then
-            echo -e "  QP=${qp}: ${bw}" >&2
+            printf "  QP=%s: %s\n" "${qp}" "${bw}" >&2
         else
-            echo -e "  QP=${qp}: ${bw} Gbps" >&2
+            printf "  QP=%s: %s Gbps\n" "${qp}" "${bw}" >&2
         fi
     done
 
@@ -594,9 +656,9 @@ run_single_test() {
     local test_name=$1
 
     case ${test_name} in
-        write) IB_TOOL="ib_write_bw" ;;
-        read)  IB_TOOL="ib_read_bw"  ;;
-        send)  IB_TOOL="ib_send_bw"  ;;
+        write) IB_TOOL="/opt/pg1-tests/perftest/bin/ib_write_bw" ;;
+        read)  IB_TOOL="/opt/pg1-tests/perftest/bin/ib_read_bw"  ;;
+        send)  IB_TOOL="/opt/pg1-tests/perftest/bin/ib_send_bw"  ;;
     esac
 
     local client_ip_tag=${CLIENT_MGMT_IP//./-}
@@ -608,6 +670,12 @@ run_single_test() {
 
     # 检查GDR环境
     GDR_AVAILABLE=$(check_gdr)
+
+    # 在父shell中获取GPU ID（避免子shell变量丢失）
+    if [ "${GDR_AVAILABLE}" = "true" ]; then
+        LOCAL_GPU_ID=$(get_affinity_gpu "${IB_DEV}")
+        REMOTE_GPU_ID=$(get_affinity_gpu "${IB_DEV}" "remote")
+    fi
 
     # 初始化文件
     > ${RAW_LOG}
@@ -723,23 +791,25 @@ run_single_test() {
 
     # 5-8. 显存测试
     if [ "${GDR_AVAILABLE}" = "true" ]; then
+        local gpu_info="Client GPU ${LOCAL_GPU_ID}, Server GPU ${REMOTE_GPU_ID}"
+
         echo ""
-        echo -e "${BLUE}--- 5/8 显存单向 ---${NC}"
+        echo -e "${BLUE}--- 5/8 显存单向 (${gpu_info}) ---${NC}"
         echo "# 5. 显存单向" >> ${RAW_LOG}
         run_test_group "GDR-Uni" "" "cuda" ""
 
         echo ""
-        echo -e "${BLUE}--- 6/8 显存双向 ---${NC}"
+        echo -e "${BLUE}--- 6/8 显存双向 (${gpu_info}) ---${NC}"
         echo "# 6. 显存双向" >> ${RAW_LOG}
         run_test_group "GDR-Bidi" "--bidirectional" "cuda" ""
 
         echo ""
-        echo -e "${BLUE}--- 7/8 显存单向 CM ---${NC}"
+        echo -e "${BLUE}--- 7/8 显存单向 CM (${gpu_info}) ---${NC}"
         echo "# 7. 显存单向 CM" >> ${RAW_LOG}
         run_test_group "GDR-Uni-CM" "" "cuda" "-R"
 
         echo ""
-        echo -e "${BLUE}--- 8/8 显存双向 CM ---${NC}"
+        echo -e "${BLUE}--- 8/8 显存双向 CM (${gpu_info}) ---${NC}"
         echo "# 8. 显存双向 CM" >> ${RAW_LOG}
         run_test_group "GDR-Bidi-CM" "--bidirectional" "cuda" "-R"
     else
