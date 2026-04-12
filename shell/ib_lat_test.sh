@@ -1,5 +1,7 @@
 #!/bin/bash
 # ib_lat_test.sh
+# 支持 ib_write_lat / ib_read_lat / ib_send_lat
+# 可指定单一类型或 all 执行全部延迟测试
 
 #===========================================
 # 使用方法
@@ -8,26 +10,25 @@ usage() {
     echo "用法: $0 [测试类型]"
     echo ""
     echo "测试类型:"
-    echo "  write   - ib_write_lat (默认)"
+    echo "  all     - 依次执行 write/read/send (默认)"
+    echo "  write   - ib_write_lat"
     echo "  read    - ib_read_lat"
     echo "  send    - ib_send_lat"
     echo ""
     echo "示例:"
-    echo "  $0 write"
-    echo "  $0 read"
-    echo "  $0 send"
+    echo "  $0          # 执行全部"
+    echo "  $0 all      # 执行全部"
+    echo "  $0 write    # 仅 write"
     exit 1
 }
 
 #===========================================
 # 解析参数
 #===========================================
-TEST_TYPE=${1:-"write"}
+TEST_TYPE=${1:-"all"}
 
 case ${TEST_TYPE} in
-    write)   IB_TOOL="ib_write_lat" ;;
-    read)    IB_TOOL="ib_read_lat"  ;;
-    send)    IB_TOOL="ib_send_lat"  ;;
+    all|write|read|send) ;;
     -h|--help) usage ;;
     *)
         echo "不支持的测试类型: ${TEST_TYPE}"
@@ -48,9 +49,8 @@ SERVER_WAIT_TIMEOUT=10
 CLIENT_TIMEOUT=60
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RESULT_FILE="./ib_${TEST_TYPE}_lat_result_${TIMESTAMP}.txt"
-TMP_RESULT="./ib_${TEST_TYPE}_lat_tmp_${TIMESTAMP}.txt"
-RAW_LOG="./ib_${TEST_TYPE}_lat_raw_${TIMESTAMP}.log"
+OUTPUT_DIR="./ib_lat_result"
+mkdir -p "${OUTPUT_DIR}"
 
 SIZES=(2 4 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 \
        32768 65536 131072 262144 524288 1048576 2097152 4194304 8388608)
@@ -61,6 +61,7 @@ SIZES=(2 4 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 \
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
 # SSH公共参数（抑制banner输出）
@@ -195,15 +196,16 @@ check_ssh() {
 # 检查工具是否存在
 #===========================================
 check_tool() {
-    if ! command -v ${IB_TOOL} &> /dev/null; then
-        echo -e "${RED}[ERROR] 本机未找到 ${IB_TOOL}，请安装 perftest${NC}"
+    local tool=$1
+    if ! command -v ${tool} &> /dev/null; then
+        echo -e "${RED}[ERROR] 本机未找到 ${tool}，请安装 perftest${NC}"
         exit 1
     fi
     ssh ${SSH_OPTS} \
         ${SERVER_USER}@${SERVER_IP} \
-        "command -v ${IB_TOOL}" &>/dev/null
+        "command -v ${tool}" &>/dev/null
     if [ $? -ne 0 ]; then
-        echo -e "${RED}[ERROR] server端未找到 ${IB_TOOL}，请安装 perftest${NC}"
+        echo -e "${RED}[ERROR] server端未找到 ${tool}，请安装 perftest${NC}"
         exit 1
     fi
 }
@@ -238,7 +240,6 @@ start_server() {
 
 #===========================================
 # 验证server端是否成功启动
-# 所有输出写入RAW_LOG，不打印到终端
 # 返回: 0=成功 1=失败
 #===========================================
 verify_server() {
@@ -263,7 +264,6 @@ verify_server() {
             if echo "${log_status}" | grep -qiE "error|failed|cannot|unable"; then
                 echo "[ERROR] server启动失败 size=${size}" >> ${RAW_LOG}
                 echo "${log_status}"                       >> ${RAW_LOG}
-                # 终端只打印错误
                 echo -e "${RED}[ERROR] size=${size} server启动失败，详情见: ${RAW_LOG}${NC}" >&2
                 return 1
             fi
@@ -328,12 +328,10 @@ run_client() {
     if [ -n "$data_line" ]; then
         local formatted
         formatted=$(print_row "$data_line")
-        # 只打印数据行到终端
         echo "$formatted"
         echo "$formatted" >> ${TMP_RESULT}
     else
         echo -e "${RED}[WARN] size=${size} 未获取到数据，详情见: ${RAW_LOG}${NC}" >&2
-        # 写入占位行
         printf "%-12s %-14s %-14s %-14s %-18s %-14s %-16s %-24s %-s\n" \
             "${size}" "-" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" \
             >> ${TMP_RESULT}
@@ -345,33 +343,45 @@ run_client() {
 #===========================================
 cleanup_on_exit() {
     echo ""
-    echo -e "${YELLOW}[INFO] 捕获到中断信号，正在清理本地和server端 ${IB_TOOL} 进程...${NC}"
-    pkill -f "${IB_TOOL}" 2>/dev/null
-    kill_server
+    echo -e "${YELLOW}[INFO] 捕获到中断信号，正在清理本地和server端进程...${NC}"
+    pkill -f "ib_write_lat\|ib_read_lat\|ib_send_lat" 2>/dev/null
+    for tool in ib_write_lat ib_read_lat ib_send_lat; do
+        pssh -H "${SERVER_USER}@${SERVER_IP}" \
+             -t 10 -i \
+             -x "${PSSH_OPTS}" \
+             "pkill -f ${tool} 2>/dev/null" &>/dev/null
+    done
     echo -e "${YELLOW}[INFO] 清理完成，退出${NC}"
     exit 130
 }
 trap cleanup_on_exit INT TERM
 
 #===========================================
-# 主流程
+# 执行单个类型的延迟测试
+# 参数: test_name (write/read/send)
 #===========================================
-main() {
-    check_pssh
-    check_ssh
-    check_tool
+run_single_test() {
+    local test_name=$1
 
-    # 获取业务IP（失败直接退出，错误信息打印到stderr）
-    CLIENT_BOND_IP=$(get_local_bond_ip)
-    SERVER_BOND_IP=$(get_server_bond_ip)
+    case ${test_name} in
+        write) IB_TOOL="ib_write_lat" ;;
+        read)  IB_TOOL="ib_read_lat"  ;;
+        send)  IB_TOOL="ib_send_lat"  ;;
+    esac
+
+    RESULT_FILE="${OUTPUT_DIR}/ib_${test_name}_lat_result_${TIMESTAMP}.txt"
+    TMP_RESULT="${OUTPUT_DIR}/ib_${test_name}_lat_tmp_${TIMESTAMP}.txt"
+    RAW_LOG="${OUTPUT_DIR}/ib_${test_name}_lat_raw_${TIMESTAMP}.log"
+
+    check_tool "${IB_TOOL}"
 
     # 初始化文件
     > ${TMP_RESULT}
     > ${RAW_LOG}
 
     # 构建测试命令字符串
-    SERVER_CMD="${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s <size>"
-    CLIENT_CMD="${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s <size> ${SERVER_BOND_IP}"
+    local server_cmd="${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s <size>"
+    local client_cmd="${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s <size> ${SERVER_BOND_IP}"
 
     # 写入结果文件头部
     {
@@ -388,19 +398,15 @@ main() {
         echo "# 迭代数       : ${ITERATIONS}"
         echo "#"
         echo "# 测试命令:"
-        echo "#   [Server端] ${SERVER_CMD}"
-        echo "#   [Client端] ${CLIENT_CMD}"
+        echo "#   [Server端] ${server_cmd}"
+        echo "#   [Client端] ${client_cmd}"
         echo "########################################"
         echo ""
     } > ${RESULT_FILE}
 
-    # 终端打印基本信息
-    echo "测试工具     : ${IB_TOOL}"
-    echo "Server 管理IP: ${SERVER_IP}"
-    echo "Server 业务IP: ${SERVER_BOND_IP}"
-    echo "Client 业务IP: ${CLIENT_BOND_IP}"
-    echo "Device       : ${IB_DEV}"
-    echo "迭代数       : ${ITERATIONS}"
+    # 终端打印信息
+    echo ""
+    echo -e "${BLUE}========== ${IB_TOOL} ==========${NC}"
     echo "结果文件     : ${RESULT_FILE}"
     echo ""
 
@@ -408,6 +414,7 @@ main() {
     kill_server
 
     # 打印表头（终端+文件）
+    local header
     header=$(print_header)
     echo "$header"
     echo "$header" >> ${RESULT_FILE}
@@ -419,10 +426,8 @@ main() {
         idx=$((idx + 1))
         echo -ne "${YELLOW}  [${idx}/${total}] size=${size} 测试中...${NC}\r" >&2
 
-        # 启动server（静默）
         start_server ${size}
 
-        # 验证server（过程写RAW_LOG，失败才打印stderr）
         if ! verify_server ${size}; then
             echo -e "${RED}  [${idx}/${total}] size=${size} server启动失败${NC}" >&2
             printf "%-12s %-14s %-14s %-14s %-18s %-14s %-16s %-24s %-s\n" \
@@ -432,24 +437,49 @@ main() {
             continue
         fi
 
-        # 执行client测试（只打印数据行）
         run_client ${size}
         kill_server
-
-        echo -e "${GREEN}  [${idx}/${total}] size=${size} 完成${NC}" >&2
     done
 
     # 汇总写入结果文件
     cat ${TMP_RESULT} >> ${RESULT_FILE}
+    rm -f ${TMP_RESULT}
+
+    echo ""
+    echo -e "${GREEN}${IB_TOOL} 测试完成，结果文件: ${RESULT_FILE}${NC}"
+}
+
+#===========================================
+# 主流程
+#===========================================
+main() {
+    check_pssh
+    check_ssh
+
+    CLIENT_BOND_IP=$(get_local_bond_ip)
+    SERVER_BOND_IP=$(get_server_bond_ip)
+
+    echo "Server 管理IP: ${SERVER_IP}"
+    echo "Server 业务IP: ${SERVER_BOND_IP}"
+    echo "Client 业务IP: ${CLIENT_BOND_IP}"
+    echo "Device       : ${IB_DEV}"
+    echo "迭代数       : ${ITERATIONS}"
+
+    local test_list=()
+    if [ "${TEST_TYPE}" = "all" ]; then
+        test_list=(write read send)
+    else
+        test_list=("${TEST_TYPE}")
+    fi
+
+    for t in "${test_list[@]}"; do
+        run_single_test "${t}"
+    done
 
     echo ""
     echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN} 测试完成！${NC}"
-    echo -e " 结果文件 : ${RESULT_FILE}"
-    echo -e " 原始日志 : ${RAW_LOG}"
+    echo -e "${GREEN} 全部测试完成！${NC}"
     echo -e "${GREEN}========================================${NC}"
-
-    rm -f ${TMP_RESULT}
 }
 
 main

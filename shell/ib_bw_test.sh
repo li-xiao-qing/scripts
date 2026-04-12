@@ -495,7 +495,6 @@ run_test_group() {
         bw=$(run_client ${qp} "${bidir}" "${use_cuda}" "${use_cm}")
         kill_server
 
-        echo -e "${GREEN}  [${idx}/${total}] QP=${qp} 完成: ${bw} Gbps${NC}" >&2
         bw_values+=("${bw}")
     done
 
