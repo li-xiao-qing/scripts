@@ -39,9 +39,9 @@ esac
 #===========================================
 # 配置区域
 #===========================================
-SERVER_IP="10.36.33.170"     # 管理IP，仅用于SSH登录
+SERVER_IP="10.36.32.195"     # 管理IP，仅用于SSH登录
 SERVER_USER="root"
-IB_DEV="mlx5_bond_2"
+IB_DEV="mlx5_bond_1"
 TCLASS="16"
 GID_INDEX="3"
 ITERATIONS="1000"
@@ -374,8 +374,8 @@ run_single_test() {
 
     local client_ip_tag=${CLIENT_MGMT_IP//./-}
     local server_ip_tag=${SERVER_IP//./-}
-    RESULT_FILE="${OUTPUT_DIR}/ib_${test_name}_lat_${client_ip_tag}_${server_ip_tag}_result_${TIMESTAMP}.txt"
-    RAW_LOG="${OUTPUT_DIR}/ib_${test_name}_lat_${client_ip_tag}_${server_ip_tag}_raw_${TIMESTAMP}.log"
+    RESULT_FILE="${OUTPUT_DIR}/${client_ip_tag}_${server_ip_tag}_ib_${test_name}_lat_result_${TIMESTAMP}.txt"
+    RAW_LOG="${OUTPUT_DIR}/${client_ip_tag}_${server_ip_tag}_ib_${test_name}_lat_raw_${TIMESTAMP}.log"
 
     check_tool "${IB_TOOL}"
 
