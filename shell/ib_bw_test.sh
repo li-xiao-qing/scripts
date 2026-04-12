@@ -753,6 +753,10 @@ run_single_test() {
         } >> ${RAW_LOG}
     fi
 
+    # 打印完整汇总表
+    echo ""
+    echo -e "${BLUE}========== ${IB_TOOL} 测试结果汇总 ==========${NC}"
+    grep -v "^#" ${RESULT_FILE} | grep -v "^$"
     echo ""
     echo -e "${GREEN}${IB_TOOL} 测试完成，结果文件: ${RESULT_FILE}${NC}"
 }
