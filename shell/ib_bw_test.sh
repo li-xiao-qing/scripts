@@ -46,7 +46,7 @@ SERVER_USER="root"
 IB_DEV="mlx5_bond_2"
 TCLASS="16"
 GID_INDEX="3"
-ITERATIONS="1000"
+DURATION="1"
 MSG_SIZE="65536"
 SERVER_WAIT_TIMEOUT=10
 CLIENT_TIMEOUT=60
@@ -286,7 +286,7 @@ build_cmd_str() {
 
     local cmd="${IB_TOOL}"
     [ -n "${gid_param}" ] && cmd="${cmd} ${gid_param}"
-    cmd="${cmd} -n ${ITERATIONS}"
+    cmd="${cmd} -D ${DURATION}"
     cmd="${cmd} --tclass=${TCLASS}"
     cmd="${cmd} --ib-dev=${IB_DEV}"
     cmd="${cmd} -s ${MSG_SIZE}"
@@ -339,7 +339,7 @@ start_server() {
          -t 30 -i \
          "nohup ${IB_TOOL} \
              ${gid_param} \
-             -n ${ITERATIONS} \
+             -D ${DURATION} \
              --tclass=${TCLASS} \
              --ib-dev=${IB_DEV} \
              -s ${MSG_SIZE} \
@@ -418,7 +418,7 @@ run_client() {
     local raw_output
     raw_output=$(timeout ${CLIENT_TIMEOUT} ${IB_TOOL} \
         ${gid_param} \
-        -n ${ITERATIONS} \
+        -D ${DURATION} \
         --tclass=${TCLASS} \
         --ib-dev=${IB_DEV} \
         -s ${MSG_SIZE} \
@@ -563,7 +563,7 @@ run_single_test() {
         echo "# Client 业务IP: ${CLIENT_BOND_IP}"
         echo "# Server 业务IP: ${SERVER_BOND_IP}"
         echo "# Device       : ${IB_DEV}"
-        echo "# 迭代数       : ${ITERATIONS}"
+        echo "# 测试时长     : ${DURATION}s"
         echo "# 消息大小     : ${MSG_SIZE} bytes"
         echo "# QP列表       : ${QPS[*]}"
         echo "# GDR可用      : ${GDR_AVAILABLE}"
@@ -584,7 +584,7 @@ run_single_test() {
         echo "# Device       : ${IB_DEV}"
         echo "# tclass       : ${TCLASS}"
         echo "# GID          : ${GID_INDEX}"
-        echo "# 迭代数       : ${ITERATIONS}"
+        echo "# 测试时长     : ${DURATION}s"
         echo "# 消息大小     : ${MSG_SIZE} bytes"
         echo "# QP列表       : ${QPS[*]}"
         echo "# GDR可用      : ${GDR_AVAILABLE}"
@@ -702,7 +702,7 @@ main() {
     echo "Client 业务IP: ${CLIENT_BOND_IP}"
     echo "Server 业务IP: ${SERVER_BOND_IP}"
     echo "Device       : ${IB_DEV}"
-    echo "迭代数       : ${ITERATIONS}"
+    echo "测试时长     : ${DURATION}s"
 
     local test_list=()
     if [ "${TEST_TYPE}" = "all" ]; then
