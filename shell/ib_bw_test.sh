@@ -138,8 +138,41 @@ get_server_bond_ip() {
 }
 
 #===========================================
+# 获取与IB设备亲和的GPU设备号
+# 参数: ib_dev [remote: 是否远程获取]
+# 返回: GPU index 或空字符串
+#===========================================
+get_affinity_gpu() {
+    local ib_dev=$1
+    local remote=$2
+
+    local cmd='
+ib_numa=$(cat /sys/class/infiniband/'"${ib_dev}"'/device/numa_node 2>/dev/null)
+if [ -z "$ib_numa" ]; then exit 1; fi
+gpu_idx=0
+for gpu_dir in /sys/bus/pci/devices/*/; do
+    if [ -d "${gpu_dir}driver" ] && readlink "${gpu_dir}driver" 2>/dev/null | grep -q nvidia; then
+        gpu_numa=$(cat "${gpu_dir}numa_node" 2>/dev/null)
+        if [ "$gpu_numa" = "$ib_numa" ]; then
+            echo $gpu_idx
+            exit 0
+        fi
+        gpu_idx=$((gpu_idx + 1))
+    fi
+done
+echo 0
+'
+    if [ "${remote}" = "remote" ]; then
+        ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} "${cmd}" 2>/dev/null
+    else
+        eval "${cmd}"
+    fi
+}
+
+#===========================================
 # 检查CUDA/GDR环境
 # 返回: true / false
+# 设置全局变量: LOCAL_GPU_ID, REMOTE_GPU_ID
 #===========================================
 check_gdr() {
     if ! command -v nvidia-smi &>/dev/null; then
@@ -171,6 +204,30 @@ check_gdr() {
         echo "false"; return
     fi
 
+    # 检查本机 GDR 内核模块
+    if ! lsmod | grep -qE "nv_peer_mem|nvidia_peermem"; then
+        echo -e "${RED}[WARN] 本机未加载nv_peer_mem/nvidia_peermem模块，将跳过GDR测试${NC}" >&2
+        echo "false"; return
+    fi
+
+    # 检查server端 GDR 内核模块
+    local server_peermem
+    server_peermem=$(ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+        "lsmod | grep -cE 'nv_peer_mem|nvidia_peermem'" 2>/dev/null)
+    if [ "${server_peermem:-0}" -eq 0 ]; then
+        echo -e "${RED}[WARN] server端未加载nv_peer_mem/nvidia_peermem模块，将跳过GDR测试${NC}" >&2
+        echo "false"; return
+    fi
+
+    # 检查 perftest 是否支持 --use_cuda
+    if ! ${IB_TOOL} --help 2>&1 | grep -q "use_cuda"; then
+        echo -e "${RED}[WARN] 本机perftest未编译CUDA支持，将跳过GDR测试${NC}" >&2
+        echo "false"; return
+    fi
+
+    LOCAL_GPU_ID=$(get_affinity_gpu "${IB_DEV}")
+    REMOTE_GPU_ID=$(get_affinity_gpu "${IB_DEV}" "remote")
+
     echo "true"
 }
 
@@ -178,12 +235,7 @@ check_gdr() {
 # 打印表头
 #===========================================
 print_header() {
-    local title="测试场景(Gbps)"
-    local byte_len=$(echo -n "${title}" | wc -c)
-    local char_len=${#title}
-    local cn_count=$(( (byte_len - char_len) / 2 ))
-    local pad_width=$((20 - cn_count))
-    printf "%-${pad_width}s" "${title}"
+    printf "%-16s" "Case(Gbps)"
     for qp in "${QPS[@]}"; do
         printf "%-12s" "QP=${qp}"
     done
@@ -191,18 +243,14 @@ print_header() {
 }
 
 #===========================================
-# 打印一行数据（中文占2列宽，需手动补偿）
+# 打印一行数据
 #===========================================
 print_row() {
     local label=$1
     shift
     local values=("$@")
 
-    local byte_len=$(echo -n "${label}" | wc -c)
-    local char_len=${#label}
-    local cn_count=$(( (byte_len - char_len) / 2 ))
-    local pad_width=$((20 - cn_count))
-    printf "%-${pad_width}s" "${label}"
+    printf "%-16s" "${label}"
     for val in "${values[@]}"; do
         printf "%-12s" "${val}"
     done
@@ -293,7 +341,13 @@ build_cmd_str() {
     cmd="${cmd} --qp=${qp}"
     cmd="${cmd} --report_gbits"
     [ -n "${bidir}"    ] && cmd="${cmd} ${bidir}"
-    [ -n "${use_cuda}" ] && cmd="${cmd} ${use_cuda}"
+    if [ "${use_cuda}" = "cuda" ]; then
+        if [ "${side}" = "server" ]; then
+            cmd="${cmd} --use_cuda=${REMOTE_GPU_ID}"
+        else
+            cmd="${cmd} --use_cuda=${LOCAL_GPU_ID}"
+        fi
+    fi
     [ -n "${use_cm}"   ] && cmd="${cmd} ${use_cm}"
     [ "${side}" = "client" ] && cmd="${cmd} ${SERVER_BOND_IP}"
 
@@ -334,6 +388,9 @@ start_server() {
     local gid_param
     gid_param=$(build_gid_param "${use_cm}")
 
+    local cuda_param=""
+    [ "${use_cuda}" = "cuda" ] && cuda_param="--use_cuda=${REMOTE_GPU_ID}"
+
     pssh -H "${SERVER_USER}@${SERVER_IP}" \
          -x "${PSSH_SSH_OPTS}" \
          -t 30 -i \
@@ -346,7 +403,7 @@ start_server() {
              --qp=${qp} \
              --report_gbits \
              ${bidir} \
-             ${use_cuda} \
+             ${cuda_param} \
              ${use_cm} \
              > /tmp/ib_bw_server_qp${qp}.log 2>&1 &
           sleep 0.5" &>/dev/null
@@ -414,6 +471,9 @@ run_client() {
     local gid_param
     gid_param=$(build_gid_param "${use_cm}")
 
+    local cuda_param=""
+    [ "${use_cuda}" = "cuda" ] && cuda_param="--use_cuda=${LOCAL_GPU_ID}"
+
     local stderr_tmp=$(mktemp)
     local raw_output
     raw_output=$(timeout ${CLIENT_TIMEOUT} ${IB_TOOL} \
@@ -425,7 +485,7 @@ run_client() {
         --qp=${qp} \
         --report_gbits \
         ${bidir} \
-        ${use_cuda} \
+        ${cuda_param} \
         ${use_cm} \
         ${SERVER_BOND_IP} 2>${stderr_tmp})
     local rc=$?
@@ -567,6 +627,10 @@ run_single_test() {
         echo "# 消息大小     : ${MSG_SIZE} bytes"
         echo "# QP列表       : ${QPS[*]}"
         echo "# GDR可用      : ${GDR_AVAILABLE}"
+        if [ "${GDR_AVAILABLE}" = "true" ]; then
+            echo "# Client GPU   : ${LOCAL_GPU_ID}"
+            echo "# Server GPU   : ${REMOTE_GPU_ID}"
+        fi
         echo "########################################"
         echo ""
     } > ${RESULT_FILE}
@@ -588,6 +652,10 @@ run_single_test() {
         echo "# 消息大小     : ${MSG_SIZE} bytes"
         echo "# QP列表       : ${QPS[*]}"
         echo "# GDR可用      : ${GDR_AVAILABLE}"
+        if [ "${GDR_AVAILABLE}" = "true" ]; then
+            echo "# Client GPU   : ${LOCAL_GPU_ID}"
+            echo "# Server GPU   : ${REMOTE_GPU_ID}"
+        fi
         echo "#"
         echo "# 测试场景及对应命令:"
         echo "#"
@@ -595,13 +663,12 @@ run_single_test() {
         build_cmd_info "2" "内存双向"    "--bidirectional"  ""           ""
         build_cmd_info "3" "内存单向 CM" ""                 ""           "-R"
         build_cmd_info "4" "内存双向 CM" "--bidirectional"  ""           "-R"
-        if [ "${GDR_AVAILABLE}" = "true" ]; then
-            build_cmd_info "5" "显存单向"    ""                "--use_cuda"  ""
-            build_cmd_info "6" "显存双向"    "--bidirectional" "--use_cuda"  ""
-            build_cmd_info "7" "显存单向 CM" ""                "--use_cuda"  "-R"
-            build_cmd_info "8" "显存双向 CM" "--bidirectional" "--use_cuda"  "-R"
-        else
-            echo "# 场景5-8: 显存测试 (跳过，GPU不可用)"
+        build_cmd_info "5" "显存单向"    ""                "cuda"  ""
+        build_cmd_info "6" "显存双向"    "--bidirectional" "cuda"  ""
+        build_cmd_info "7" "显存单向 CM" ""                "cuda"  "-R"
+        build_cmd_info "8" "显存双向 CM" "--bidirectional" "cuda"  "-R"
+        if [ "${GDR_AVAILABLE}" != "true" ]; then
+            echo "# (场景5-8 已跳过，GPU不可用)"
             echo "#"
         fi
         echo "########################################"
@@ -614,6 +681,10 @@ run_single_test() {
     echo "消息大小     : ${MSG_SIZE} bytes"
     echo "QP列表       : ${QPS[*]}"
     echo "GDR可用      : ${GDR_AVAILABLE}"
+    if [ "${GDR_AVAILABLE}" = "true" ]; then
+        echo "Client GPU   : ${LOCAL_GPU_ID}"
+        echo "Server GPU   : ${REMOTE_GPU_ID}"
+    fi
     echo "结果文件     : ${RESULT_FILE}"
     echo ""
 
@@ -630,47 +701,47 @@ run_single_test() {
     echo ""
     echo -e "${BLUE}--- 1/8 内存单向 ---${NC}"
     echo "# 1. 内存单向" >> ${RAW_LOG}
-    run_test_group "Mem 单向" "" "" ""
+    run_test_group "Mem-Uni" "" "" ""
 
     # 2. 内存双向
     echo ""
     echo -e "${BLUE}--- 2/8 内存双向 ---${NC}"
     echo "# 2. 内存双向" >> ${RAW_LOG}
-    run_test_group "Mem 双向" "--bidirectional" "" ""
+    run_test_group "Mem-Bidi" "--bidirectional" "" ""
 
     # 3. 内存单向 CM
     echo ""
     echo -e "${BLUE}--- 3/8 内存单向 CM ---${NC}"
     echo "# 3. 内存单向 CM" >> ${RAW_LOG}
-    run_test_group "Mem 单向 CM" "" "" "-R"
+    run_test_group "Mem-Uni-CM" "" "" "-R"
 
     # 4. 内存双向 CM
     echo ""
     echo -e "${BLUE}--- 4/8 内存双向 CM ---${NC}"
     echo "# 4. 内存双向 CM" >> ${RAW_LOG}
-    run_test_group "Mem 双向 CM" "--bidirectional" "" "-R"
+    run_test_group "Mem-Bidi-CM" "--bidirectional" "" "-R"
 
     # 5-8. 显存测试
     if [ "${GDR_AVAILABLE}" = "true" ]; then
         echo ""
         echo -e "${BLUE}--- 5/8 显存单向 ---${NC}"
         echo "# 5. 显存单向" >> ${RAW_LOG}
-        run_test_group "GDR 单向" "" "--use_cuda" ""
+        run_test_group "GDR-Uni" "" "cuda" ""
 
         echo ""
         echo -e "${BLUE}--- 6/8 显存双向 ---${NC}"
         echo "# 6. 显存双向" >> ${RAW_LOG}
-        run_test_group "GDR 双向" "--bidirectional" "--use_cuda" ""
+        run_test_group "GDR-Bidi" "--bidirectional" "cuda" ""
 
         echo ""
         echo -e "${BLUE}--- 7/8 显存单向 CM ---${NC}"
         echo "# 7. 显存单向 CM" >> ${RAW_LOG}
-        run_test_group "GDR 单向 CM" "" "--use_cuda" "-R"
+        run_test_group "GDR-Uni-CM" "" "cuda" "-R"
 
         echo ""
         echo -e "${BLUE}--- 8/8 显存双向 CM ---${NC}"
         echo "# 8. 显存双向 CM" >> ${RAW_LOG}
-        run_test_group "GDR 双向 CM" "--bidirectional" "--use_cuda" "-R"
+        run_test_group "GDR-Bidi-CM" "--bidirectional" "cuda" "-R"
     else
         echo ""
         echo -e "${RED}[SKIP] GPU不可用，跳过显存相关测试(5-8)${NC}"
