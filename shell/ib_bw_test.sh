@@ -178,25 +178,31 @@ check_gdr() {
 # 打印表头
 #===========================================
 print_header() {
-    printf "%-28s" "测试场景(Gbps)"
+    local title="测试场景(Gbps)"
+    local byte_len=$(echo -n "${title}" | wc -c)
+    local char_len=${#title}
+    local cn_count=$(( (byte_len - char_len) / 2 ))
+    local pad_width=$((20 - cn_count))
+    printf "%-${pad_width}s" "${title}"
     for qp in "${QPS[@]}"; do
         printf "%-12s" "QP=${qp}"
     done
     printf "\n"
-
-    local sep_len=$((28 + 12 * ${#QPS[@]}))
-    printf '%*s\n' "${sep_len}" '' | tr ' ' '-'
 }
 
 #===========================================
-# 打印一行数据
+# 打印一行数据（中文占2列宽，需手动补偿）
 #===========================================
 print_row() {
     local label=$1
     shift
     local values=("$@")
 
-    printf "%-28s" "${label}"
+    local byte_len=$(echo -n "${label}" | wc -c)
+    local char_len=${#label}
+    local cn_count=$(( (byte_len - char_len) / 2 ))
+    local pad_width=$((20 - cn_count))
+    printf "%-${pad_width}s" "${label}"
     for val in "${values[@]}"; do
         printf "%-12s" "${val}"
     done
