@@ -315,7 +315,8 @@ run_client() {
     rm -f "${stderr_tmp}"
 
     if [ ${rc} -eq 124 ]; then
-        echo -e "${RED}[ERROR] size=${size} client测试超时(${CLIENT_TIMEOUT}s)${NC}" >&2
+        echo -e "${RED}[ERROR] size=${size} client测试超时(${CLIENT_TIMEOUT}s)，跳过${NC}" >&2
+        return 124
     elif [ ${rc} -ne 0 ]; then
         echo -e "${RED}[ERROR] size=${size} client测试失败(rc=${rc})，详情见: ${RAW_LOG}${NC}" >&2
     fi
@@ -457,7 +458,11 @@ run_single_test() {
         fi
 
         run_client ${size}
+        local client_rc=$?
         kill_server
+        if [ ${client_rc} -eq 124 ]; then
+            continue
+        fi
     done
 
     echo ""

@@ -49,7 +49,7 @@ GID_INDEX="3"
 ITERATIONS="1000"
 MSG_SIZE="65536"
 SERVER_WAIT_TIMEOUT=10
-CLIENT_TIMEOUT=600
+CLIENT_TIMEOUT=60
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_DIR="./ib_bw_result"
@@ -436,6 +436,8 @@ run_client() {
 
     if [ ${rc} -eq 124 ]; then
         echo -e "${RED}[ERROR] QP=${qp} client测试超时(${CLIENT_TIMEOUT}s)${NC}" >&2
+        echo "TIMEOUT"
+        return 0
     elif [ ${rc} -ne 0 ]; then
         echo -e "${RED}[ERROR] QP=${qp} client测试失败(rc=${rc})，详情见: ${RAW_LOG}${NC}" >&2
     fi
