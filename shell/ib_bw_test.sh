@@ -490,7 +490,11 @@ run_test_group() {
         kill_server
 
         bw_values+=("${bw}")
-        echo -e "  QP=${qp}: ${bw} Gbps" >&2
+        if [ "${bw}" = "TIMEOUT" ] || [ "${bw}" = "N/A" ] || [ "${bw}" = "ERR" ]; then
+            echo -e "  QP=${qp}: ${bw}" >&2
+        else
+            echo -e "  QP=${qp}: ${bw} Gbps" >&2
+        fi
     done
 
     echo ""
