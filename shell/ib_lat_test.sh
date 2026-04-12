@@ -293,7 +293,7 @@ verify_server() {
 run_client() {
     local size=$1
 
-    local stderr_tmp="${RAW_LOG}.stderr_tmp"
+    local stderr_tmp=$(mktemp)
     local raw_output
     raw_output=$(timeout ${CLIENT_TIMEOUT} ${IB_TOOL} \
         -x ${GID_INDEX} \
@@ -304,12 +304,14 @@ run_client() {
         ${SERVER_BOND_IP} 2>${stderr_tmp})
     local rc=$?
 
-    echo "=== size=${size} rc=${rc} ===" >> ${RAW_LOG}
-    echo "$raw_output"                  >> ${RAW_LOG}
-    if [ -s "${stderr_tmp}" ]; then
-        echo "--- stderr ---" >> ${RAW_LOG}
-        cat "${stderr_tmp}"   >> ${RAW_LOG}
-    fi
+    {
+        echo "=== size=${size} rc=${rc} ==="
+        echo "$raw_output"
+        if [ -s "${stderr_tmp}" ]; then
+            echo "--- stderr ---"
+            cat "${stderr_tmp}"
+        fi
+    } >> ${RAW_LOG}
     rm -f "${stderr_tmp}"
 
     if [ ${rc} -eq 124 ]; then
@@ -329,12 +331,12 @@ run_client() {
         local formatted
         formatted=$(print_row "$data_line")
         echo "$formatted"
-        echo "$formatted" >> ${TMP_RESULT}
+        echo "$formatted" >> ${RESULT_FILE}
     else
         echo -e "${RED}[WARN] size=${size} 未获取到数据，详情见: ${RAW_LOG}${NC}" >&2
         printf "%-12s %-14s %-14s %-14s %-18s %-14s %-16s %-24s %-s\n" \
             "${size}" "-" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" \
-            >> ${TMP_RESULT}
+            >> ${RESULT_FILE}
     fi
 }
 
@@ -370,28 +372,43 @@ run_single_test() {
     esac
 
     RESULT_FILE="${OUTPUT_DIR}/ib_${test_name}_lat_result_${TIMESTAMP}.txt"
-    TMP_RESULT="${OUTPUT_DIR}/ib_${test_name}_lat_tmp_${TIMESTAMP}.txt"
     RAW_LOG="${OUTPUT_DIR}/ib_${test_name}_lat_raw_${TIMESTAMP}.log"
 
     check_tool "${IB_TOOL}"
 
     # 初始化文件
-    > ${TMP_RESULT}
     > ${RAW_LOG}
 
     # 构建测试命令字符串
     local server_cmd="${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s <size>"
     local client_cmd="${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s <size> ${SERVER_BOND_IP}"
 
-    # 写入结果文件头部
+    # 写入结果文件头部（仅基本信息）
     {
         echo "########################################"
-        echo "# ${IB_TOOL} 测试结果"
+        echo "# ${IB_TOOL} 延迟测试结果"
         echo "########################################"
         echo "# 时间         : $(date)"
+        echo "# Client 管理IP: ${CLIENT_MGMT_IP}"
         echo "# Server 管理IP: ${SERVER_IP}"
-        echo "# Server 业务IP: ${SERVER_BOND_IP}"
         echo "# Client 业务IP: ${CLIENT_BOND_IP}"
+        echo "# Server 业务IP: ${SERVER_BOND_IP}"
+        echo "# Device       : ${IB_DEV}"
+        echo "# 迭代数       : ${ITERATIONS}"
+        echo "########################################"
+        echo ""
+    } > ${RESULT_FILE}
+
+    # 写入RAW日志头部（含详细测试命令信息）
+    {
+        echo "########################################"
+        echo "# ${IB_TOOL} 延迟测试 RAW LOG"
+        echo "########################################"
+        echo "# 时间         : $(date)"
+        echo "# Client 管理IP: ${CLIENT_MGMT_IP}"
+        echo "# Server 管理IP: ${SERVER_IP}"
+        echo "# Client 业务IP: ${CLIENT_BOND_IP}"
+        echo "# Server 业务IP: ${SERVER_BOND_IP}"
         echo "# Device       : ${IB_DEV}"
         echo "# tclass       : ${TCLASS}"
         echo "# GID          : ${GID_INDEX}"
@@ -402,7 +419,7 @@ run_single_test() {
         echo "#   [Client端] ${client_cmd}"
         echo "########################################"
         echo ""
-    } > ${RESULT_FILE}
+    } >> ${RAW_LOG}
 
     # 终端打印信息
     echo ""
@@ -432,7 +449,7 @@ run_single_test() {
             echo -e "${RED}  [${idx}/${total}] size=${size} server启动失败${NC}" >&2
             printf "%-12s %-14s %-14s %-14s %-18s %-14s %-16s %-24s %-s\n" \
                 "${size}" "-" "ERR" "ERR" "ERR" "ERR" "ERR" "ERR" "ERR" \
-                | tee -a ${TMP_RESULT}
+                | tee -a ${RESULT_FILE}
             kill_server
             continue
         fi
@@ -440,10 +457,6 @@ run_single_test() {
         run_client ${size}
         kill_server
     done
-
-    # 汇总写入结果文件
-    cat ${TMP_RESULT} >> ${RESULT_FILE}
-    rm -f ${TMP_RESULT}
 
     echo ""
     echo -e "${GREEN}${IB_TOOL} 测试完成，结果文件: ${RESULT_FILE}${NC}"
@@ -458,10 +471,12 @@ main() {
 
     CLIENT_BOND_IP=$(get_local_bond_ip)
     SERVER_BOND_IP=$(get_server_bond_ip)
+    CLIENT_MGMT_IP=$(hostname -i 2>/dev/null | awk '{print $1}')
 
+    echo "Client 管理IP: ${CLIENT_MGMT_IP}"
     echo "Server 管理IP: ${SERVER_IP}"
-    echo "Server 业务IP: ${SERVER_BOND_IP}"
     echo "Client 业务IP: ${CLIENT_BOND_IP}"
+    echo "Server 业务IP: ${SERVER_BOND_IP}"
     echo "Device       : ${IB_DEV}"
     echo "迭代数       : ${ITERATIONS}"
 

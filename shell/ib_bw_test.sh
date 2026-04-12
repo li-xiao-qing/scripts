@@ -3,6 +3,7 @@
 # 支持 ib_write_bw / ib_read_bw / ib_send_bw
 # 测试场景: 内存单向 + 内存双向 + 内存单向CM + 内存双向CM
 #           + 显存单向 + 显存双向 + 显存单向CM + 显存双向CM
+# 可指定单一类型或 all 执行全部带宽测试
 
 #===========================================
 # 使用方法
@@ -11,26 +12,25 @@ usage() {
     echo "用法: $0 [测试类型]"
     echo ""
     echo "测试类型:"
-    echo "  write   - ib_write_bw (默认)"
+    echo "  all     - 依次执行 write/read/send (默认)"
+    echo "  write   - ib_write_bw"
     echo "  read    - ib_read_bw"
     echo "  send    - ib_send_bw"
     echo ""
     echo "示例:"
-    echo "  $0 write"
-    echo "  $0 read"
-    echo "  $0 send"
+    echo "  $0          # 执行全部"
+    echo "  $0 all      # 执行全部"
+    echo "  $0 write    # 仅 write"
     exit 1
 }
 
 #===========================================
 # 解析参数
 #===========================================
-TEST_TYPE=${1:-"write"}
+TEST_TYPE=${1:-"all"}
 
 case ${TEST_TYPE} in
-    write) IB_TOOL="ib_write_bw" ;;
-    read)  IB_TOOL="ib_read_bw"  ;;
-    send)  IB_TOOL="ib_send_bw"  ;;
+    all|write|read|send) ;;
     -h|--help) usage ;;
     *)
         echo "不支持的测试类型: ${TEST_TYPE}"
@@ -49,13 +49,11 @@ GID_INDEX="3"
 ITERATIONS="1000"
 MSG_SIZE="65536"
 SERVER_WAIT_TIMEOUT=10
-CLIENT_TIMEOUT_BASE=60
-CLIENT_TIMEOUT_PER_QP=0.5
+CLIENT_TIMEOUT=600
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RESULT_FILE="./ib_${TEST_TYPE}_bw_result_${TIMESTAMP}.txt"
-TMP_RESULT="./ib_${TEST_TYPE}_bw_tmp_${TIMESTAMP}.txt"
-RAW_LOG="./ib_${TEST_TYPE}_bw_raw_${TIMESTAMP}.log"
+OUTPUT_DIR="./ib_bw_result"
+mkdir -p "${OUTPUT_DIR}"
 
 # QP数量列表
 QPS=(1 4 16 64 128 256 512 1024)
@@ -231,15 +229,16 @@ check_ssh() {
 # 检查工具是否存在
 #===========================================
 check_tool() {
-    if ! command -v ${IB_TOOL} &> /dev/null; then
-        echo -e "${RED}[ERROR] 本机未找到 ${IB_TOOL}，请安装 perftest${NC}"
+    local tool=$1
+    if ! command -v ${tool} &> /dev/null; then
+        echo -e "${RED}[ERROR] 本机未找到 ${tool}，请安装 perftest${NC}"
         exit 1
     fi
     ssh ${SSH_OPTS} \
         ${SERVER_USER}@${SERVER_IP} \
-        "command -v ${IB_TOOL}" &>/dev/null
+        "command -v ${tool}" &>/dev/null
     if [ $? -ne 0 ]; then
-        echo -e "${RED}[ERROR] server端未找到 ${IB_TOOL}，请安装 perftest${NC}"
+        echo -e "${RED}[ERROR] server端未找到 ${tool}，请安装 perftest${NC}"
         exit 1
     fi
 }
@@ -349,8 +348,6 @@ start_server() {
 
 #===========================================
 # 验证server端是否成功启动
-# 过程写入RAW_LOG，失败才输出到stderr
-# 参数: qp
 # 返回: 0=成功 1=失败
 #===========================================
 verify_server() {
@@ -411,12 +408,9 @@ run_client() {
     local gid_param
     gid_param=$(build_gid_param "${use_cm}")
 
-    local client_timeout
-    client_timeout=$(awk "BEGIN {t=${CLIENT_TIMEOUT_BASE}+${qp}*${CLIENT_TIMEOUT_PER_QP}; printf \"%d\", (t<60?60:t)}")
-
-    local stderr_tmp="${RAW_LOG}.stderr_tmp"
+    local stderr_tmp=$(mktemp)
     local raw_output
-    raw_output=$(timeout ${client_timeout} ${IB_TOOL} \
+    raw_output=$(timeout ${CLIENT_TIMEOUT} ${IB_TOOL} \
         ${gid_param} \
         -n ${ITERATIONS} \
         --tclass=${TCLASS} \
@@ -430,16 +424,18 @@ run_client() {
         ${SERVER_BOND_IP} 2>${stderr_tmp})
     local rc=$?
 
-    echo "=== qp=${qp} bidir=${bidir} cuda=${use_cuda} cm=${use_cm} rc=${rc} timeout=${client_timeout}s ===" >> ${RAW_LOG}
-    echo "$raw_output" >> ${RAW_LOG}
-    if [ -s "${stderr_tmp}" ]; then
-        echo "--- stderr ---" >> ${RAW_LOG}
-        cat "${stderr_tmp}"   >> ${RAW_LOG}
-    fi
+    {
+        echo "=== qp=${qp} bidir=${bidir} cuda=${use_cuda} cm=${use_cm} rc=${rc} ==="
+        echo "$raw_output"
+        if [ -s "${stderr_tmp}" ]; then
+            echo "--- stderr ---"
+            cat "${stderr_tmp}"
+        fi
+    } >> ${RAW_LOG}
     rm -f "${stderr_tmp}"
 
     if [ ${rc} -eq 124 ]; then
-        echo -e "${RED}[ERROR] QP=${qp} client测试超时(${client_timeout}s)${NC}" >&2
+        echo -e "${RED}[ERROR] QP=${qp} client测试超时(${CLIENT_TIMEOUT}s)${NC}" >&2
     elif [ ${rc} -ne 0 ]; then
         echo -e "${RED}[ERROR] QP=${qp} client测试失败(rc=${rc})，详情见: ${RAW_LOG}${NC}" >&2
     fi
@@ -462,7 +458,6 @@ run_client() {
 #===========================================
 # 运行一组测试（遍历所有QP数量）
 # 参数: label bidir use_cuda use_cm
-# 终端只输出每个QP的带宽结果行
 #===========================================
 run_test_group() {
     local label=$1
@@ -479,10 +474,8 @@ run_test_group() {
         idx=$((idx + 1))
         echo -ne "${YELLOW}  [${idx}/${total}] QP=${qp} 测试中...${NC}\r" >&2
 
-        # 启动server（静默）
         start_server ${qp} "${bidir}" "${use_cuda}" "${use_cm}"
 
-        # 验证server（失败才输出stderr）
         if ! verify_server ${qp}; then
             echo -e "${RED}  [${idx}/${total}] QP=${qp} server启动失败，跳过${NC}" >&2
             bw_values+=("ERR")
@@ -490,19 +483,17 @@ run_test_group() {
             continue
         fi
 
-        # 执行client测试
         local bw
         bw=$(run_client ${qp} "${bidir}" "${use_cuda}" "${use_cm}")
         kill_server
 
         bw_values+=("${bw}")
+        echo -e "  QP=${qp}: ${bw} Gbps" >&2
     done
 
-    # 终端打印汇总行
+    echo ""
     print_row "${label}" "${bw_values[@]}"
-
-    # 写入临时文件
-    print_row "${label}" "${bw_values[@]}" >> ${TMP_RESULT}
+    print_row "${label}" "${bw_values[@]}" >> ${RESULT_FILE}
 }
 
 #===========================================
@@ -510,42 +501,72 @@ run_test_group() {
 #===========================================
 cleanup_on_exit() {
     echo ""
-    echo -e "${YELLOW}[INFO] 捕获到中断信号，正在清理本地和server端 ${IB_TOOL} 进程...${NC}"
-    pkill -f "${IB_TOOL}" 2>/dev/null
-    kill_server
+    echo -e "${YELLOW}[INFO] 捕获到中断信号，正在清理本地和server端进程...${NC}"
+    pkill -f "ib_write_bw\|ib_read_bw\|ib_send_bw" 2>/dev/null
+    for tool in ib_write_bw ib_read_bw ib_send_bw; do
+        pssh -H "${SERVER_USER}@${SERVER_IP}" \
+             -x "${PSSH_SSH_OPTS}" \
+             -t 10 -i \
+             "pkill -f ${tool} 2>/dev/null" &>/dev/null
+    done
     echo -e "${YELLOW}[INFO] 清理完成，退出${NC}"
     exit 130
 }
 trap cleanup_on_exit INT TERM
 
 #===========================================
-# 主流程
+# 执行单个类型的带宽测试
+# 参数: test_name (write/read/send)
 #===========================================
-main() {
-    check_pssh
-    check_ssh
-    check_tool
+run_single_test() {
+    local test_name=$1
 
-    # 检查GDR环境（过程信息写stderr，只取true/false）
+    case ${test_name} in
+        write) IB_TOOL="ib_write_bw" ;;
+        read)  IB_TOOL="ib_read_bw"  ;;
+        send)  IB_TOOL="ib_send_bw"  ;;
+    esac
+
+    RESULT_FILE="${OUTPUT_DIR}/ib_${test_name}_bw_result_${TIMESTAMP}.txt"
+    RAW_LOG="${OUTPUT_DIR}/ib_${test_name}_bw_raw_${TIMESTAMP}.log"
+
+    check_tool "${IB_TOOL}"
+
+    # 检查GDR环境
     GDR_AVAILABLE=$(check_gdr)
 
-    # 获取业务IP（失败直接退出）
-    CLIENT_BOND_IP=$(get_local_bond_ip)
-    SERVER_BOND_IP=$(get_server_bond_ip)
-
     # 初始化文件
-    > ${TMP_RESULT}
     > ${RAW_LOG}
 
-    # 写入结果文件头部
+    # 写入结果文件头部（仅基本信息）
     {
         echo "########################################"
         echo "# ${IB_TOOL} 带宽测试结果"
         echo "########################################"
         echo "# 时间         : $(date)"
+        echo "# Client 管理IP: ${CLIENT_MGMT_IP}"
         echo "# Server 管理IP: ${SERVER_IP}"
-        echo "# Server 业务IP: ${SERVER_BOND_IP}"
         echo "# Client 业务IP: ${CLIENT_BOND_IP}"
+        echo "# Server 业务IP: ${SERVER_BOND_IP}"
+        echo "# Device       : ${IB_DEV}"
+        echo "# 迭代数       : ${ITERATIONS}"
+        echo "# 消息大小     : ${MSG_SIZE} bytes"
+        echo "# QP列表       : ${QPS[*]}"
+        echo "# GDR可用      : ${GDR_AVAILABLE}"
+        echo "########################################"
+        echo ""
+    } > ${RESULT_FILE}
+
+    # 写入RAW日志头部（含详细测试命令信息）
+    {
+        echo "########################################"
+        echo "# ${IB_TOOL} 带宽测试 RAW LOG"
+        echo "########################################"
+        echo "# 时间         : $(date)"
+        echo "# Client 管理IP: ${CLIENT_MGMT_IP}"
+        echo "# Server 管理IP: ${SERVER_IP}"
+        echo "# Client 业务IP: ${CLIENT_BOND_IP}"
+        echo "# Server 业务IP: ${SERVER_BOND_IP}"
         echo "# Device       : ${IB_DEV}"
         echo "# tclass       : ${TCLASS}"
         echo "# GID          : ${GID_INDEX}"
@@ -571,14 +592,11 @@ main() {
         fi
         echo "########################################"
         echo ""
-    } > ${RESULT_FILE}
+    } >> ${RAW_LOG}
 
-    # 终端打印基本信息
-    echo "测试工具     : ${IB_TOOL}"
-    echo "Server 管理IP: ${SERVER_IP}"
-    echo "Server 业务IP: ${SERVER_BOND_IP}"
-    echo "Client 业务IP: ${CLIENT_BOND_IP}"
-    echo "Device       : ${IB_DEV}"
+    # 终端打印信息
+    echo ""
+    echo -e "${BLUE}========== ${IB_TOOL} ==========${NC}"
     echo "消息大小     : ${MSG_SIZE} bytes"
     echo "QP列表       : ${QPS[*]}"
     echo "GDR可用      : ${GDR_AVAILABLE}"
@@ -589,67 +607,56 @@ main() {
     kill_server
 
     # 打印表头（终端+文件）
+    local header
     header=$(print_header)
     echo "$header"
     echo "$header" >> ${RESULT_FILE}
 
-    #===========================================
     # 1. 内存单向
-    #===========================================
     echo ""
-    echo -e "${BLUE}========== 1/8 内存单向 ==========${NC}"
-    echo "# 1. 内存单向" >> ${TMP_RESULT}
+    echo -e "${BLUE}--- 1/8 内存单向 ---${NC}"
+    echo "# 1. 内存单向" >> ${RAW_LOG}
     run_test_group "Mem 单向" "" "" ""
 
-    #===========================================
     # 2. 内存双向
-    #===========================================
     echo ""
-    echo -e "${BLUE}========== 2/8 内存双向 ==========${NC}"
-    echo "# 2. 内存双向" >> ${TMP_RESULT}
+    echo -e "${BLUE}--- 2/8 内存双向 ---${NC}"
+    echo "# 2. 内存双向" >> ${RAW_LOG}
     run_test_group "Mem 双向" "--bidirectional" "" ""
 
-    #===========================================
     # 3. 内存单向 CM
-    #===========================================
     echo ""
-    echo -e "${BLUE}========== 3/8 内存单向 CM ==========${NC}"
-    echo "# 3. 内存单向 CM" >> ${TMP_RESULT}
+    echo -e "${BLUE}--- 3/8 内存单向 CM ---${NC}"
+    echo "# 3. 内存单向 CM" >> ${RAW_LOG}
     run_test_group "Mem 单向 CM" "" "" "-R"
 
-    #===========================================
     # 4. 内存双向 CM
-    #===========================================
     echo ""
-    echo -e "${BLUE}========== 4/8 内存双向 CM ==========${NC}"
-    echo "# 4. 内存双向 CM" >> ${TMP_RESULT}
+    echo -e "${BLUE}--- 4/8 内存双向 CM ---${NC}"
+    echo "# 4. 内存双向 CM" >> ${RAW_LOG}
     run_test_group "Mem 双向 CM" "--bidirectional" "" "-R"
 
-    #===========================================
     # 5-8. 显存测试
-    #===========================================
     if [ "${GDR_AVAILABLE}" = "true" ]; then
-
         echo ""
-        echo -e "${BLUE}========== 5/8 显存单向 ==========${NC}"
-        echo "# 5. 显存单向" >> ${TMP_RESULT}
+        echo -e "${BLUE}--- 5/8 显存单向 ---${NC}"
+        echo "# 5. 显存单向" >> ${RAW_LOG}
         run_test_group "GDR 单向" "" "--use_cuda" ""
 
         echo ""
-        echo -e "${BLUE}========== 6/8 显存双向 ==========${NC}"
-        echo "# 6. 显存双向" >> ${TMP_RESULT}
+        echo -e "${BLUE}--- 6/8 显存双向 ---${NC}"
+        echo "# 6. 显存双向" >> ${RAW_LOG}
         run_test_group "GDR 双向" "--bidirectional" "--use_cuda" ""
 
         echo ""
-        echo -e "${BLUE}========== 7/8 显存单向 CM ==========${NC}"
-        echo "# 7. 显存单向 CM" >> ${TMP_RESULT}
+        echo -e "${BLUE}--- 7/8 显存单向 CM ---${NC}"
+        echo "# 7. 显存单向 CM" >> ${RAW_LOG}
         run_test_group "GDR 单向 CM" "" "--use_cuda" "-R"
 
         echo ""
-        echo -e "${BLUE}========== 8/8 显存双向 CM ==========${NC}"
-        echo "# 8. 显存双向 CM" >> ${TMP_RESULT}
+        echo -e "${BLUE}--- 8/8 显存双向 CM ---${NC}"
+        echo "# 8. 显存双向 CM" >> ${RAW_LOG}
         run_test_group "GDR 双向 CM" "--bidirectional" "--use_cuda" "-R"
-
     else
         echo ""
         echo -e "${RED}[SKIP] GPU不可用，跳过显存相关测试(5-8)${NC}"
@@ -658,20 +665,46 @@ main() {
             echo "# 6. 显存双向    (跳过)"
             echo "# 7. 显存单向 CM (跳过)"
             echo "# 8. 显存双向 CM (跳过)"
-        } >> ${TMP_RESULT}
+        } >> ${RAW_LOG}
     fi
 
-    # 汇总写入结果文件
-    cat ${TMP_RESULT} >> ${RESULT_FILE}
+    echo ""
+    echo -e "${GREEN}${IB_TOOL} 测试完成，结果文件: ${RESULT_FILE}${NC}"
+}
+
+#===========================================
+# 主流程
+#===========================================
+main() {
+    check_pssh
+    check_ssh
+
+    CLIENT_BOND_IP=$(get_local_bond_ip)
+    SERVER_BOND_IP=$(get_server_bond_ip)
+    CLIENT_MGMT_IP=$(hostname -i 2>/dev/null | awk '{print $1}')
+
+    echo "Client 管理IP: ${CLIENT_MGMT_IP}"
+    echo "Server 管理IP: ${SERVER_IP}"
+    echo "Client 业务IP: ${CLIENT_BOND_IP}"
+    echo "Server 业务IP: ${SERVER_BOND_IP}"
+    echo "Device       : ${IB_DEV}"
+    echo "迭代数       : ${ITERATIONS}"
+
+    local test_list=()
+    if [ "${TEST_TYPE}" = "all" ]; then
+        test_list=(write read send)
+    else
+        test_list=("${TEST_TYPE}")
+    fi
+
+    for t in "${test_list[@]}"; do
+        run_single_test "${t}"
+    done
 
     echo ""
     echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN} 测试完成！${NC}"
-    echo -e " 结果文件 : ${RESULT_FILE}"
-    echo -e " 原始日志 : ${RAW_LOG}"
+    echo -e "${GREEN} 全部测试完成！${NC}"
     echo -e "${GREEN}========================================${NC}"
-
-    rm -f ${TMP_RESULT}
 }
 
 main
