@@ -371,8 +371,10 @@ run_single_test() {
         send)  IB_TOOL="ib_send_lat"  ;;
     esac
 
-    RESULT_FILE="${OUTPUT_DIR}/ib_${test_name}_lat_result_${TIMESTAMP}.txt"
-    RAW_LOG="${OUTPUT_DIR}/ib_${test_name}_lat_raw_${TIMESTAMP}.log"
+    local client_ip_tag=${CLIENT_MGMT_IP//./-}
+    local server_ip_tag=${SERVER_IP//./-}
+    RESULT_FILE="${OUTPUT_DIR}/ib_${test_name}_lat_${client_ip_tag}_${server_ip_tag}_result_${TIMESTAMP}.txt"
+    RAW_LOG="${OUTPUT_DIR}/ib_${test_name}_lat_${client_ip_tag}_${server_ip_tag}_raw_${TIMESTAMP}.log"
 
     check_tool "${IB_TOOL}"
 
