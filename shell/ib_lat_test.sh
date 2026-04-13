@@ -7,7 +7,7 @@
 # 使用方法
 #===========================================
 usage() {
-    echo "用法: $0 [测试类型]"
+    echo "用法: $0 [选项] [测试类型]"
     echo ""
     echo "测试类型:"
     echo "  all     - 依次执行 write/read/send (默认)"
@@ -15,33 +15,41 @@ usage() {
     echo "  read    - ib_read_lat"
     echo "  send    - ib_send_lat"
     echo ""
+    echo "选项:"
+    echo "  --no-numa   禁用CPU NUMA亲和绑定（默认启用）"
+    echo ""
     echo "示例:"
     echo "  $0          # 执行全部"
     echo "  $0 all      # 执行全部"
     echo "  $0 write    # 仅 write"
+    echo "  $0 --no-numa        # 全部测试，不绑定CPU NUMA亲和"
     exit 1
 }
 
 #===========================================
 # 解析参数
 #===========================================
-TEST_TYPE=${1:-"all"}
+NUMA_AFFINITY=true
+TEST_TYPE="all"
 
-case ${TEST_TYPE} in
-    all|write|read|send) ;;
-    -h|--help) usage ;;
-    *)
-        echo "不支持的测试类型: ${TEST_TYPE}"
-        usage
-        ;;
-esac
+while [ $# -gt 0 ]; do
+    case $1 in
+        --no-numa)  NUMA_AFFINITY=false; shift ;;
+        -h|--help)  usage ;;
+        all|write|read|send) TEST_TYPE=$1; shift ;;
+        *)
+            echo "不支持的参数: $1"
+            usage
+            ;;
+    esac
+done
 
 #===========================================
 # 配置区域
 #===========================================
 SERVER_IP="10.36.32.195"     # 管理IP，仅用于SSH登录
 SERVER_USER="root"
-IB_DEV="mlx5_bond_1"
+IB_DEV="mlx5_bond_2"
 TCLASS="16"
 GID_INDEX="3"
 ITERATIONS="1000"
@@ -132,6 +140,30 @@ get_server_bond_ip() {
     fi
 
     echo "${bond_ip}"
+}
+
+#===========================================
+# 获取 IB 设备的 NUMA 节点号
+# 参数: ib_dev [remote]
+# 返回: NUMA 节点号，检测失败返回空
+#===========================================
+get_numa_node() {
+    local ib_dev=$1
+    local remote=$2
+
+    local numa_node
+    if [ "${remote}" = "remote" ]; then
+        numa_node=$(ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+            "cat /sys/class/infiniband/${ib_dev}/device/numa_node 2>/dev/null")
+    else
+        numa_node=$(cat /sys/class/infiniband/${ib_dev}/device/numa_node 2>/dev/null)
+    fi
+
+    if [ -z "$numa_node" ] || [ "$numa_node" = "-1" ]; then
+        echo ""
+    else
+        echo "$numa_node"
+    fi
 }
 
 #===========================================
@@ -228,7 +260,7 @@ start_server() {
     pssh -H "${SERVER_USER}@${SERVER_IP}" \
          -t 30 -i \
          -x "${PSSH_OPTS}" \
-         "nohup ${IB_TOOL} \
+         "nohup ${REMOTE_NUMA_PREFIX} ${IB_TOOL} \
              -x ${GID_INDEX} \
              -n ${ITERATIONS} \
              --tclass=${TCLASS} \
@@ -295,7 +327,7 @@ run_client() {
 
     local stderr_tmp=$(mktemp)
     local raw_output
-    raw_output=$(timeout ${CLIENT_TIMEOUT} ${IB_TOOL} \
+    raw_output=$(timeout ${CLIENT_TIMEOUT} ${LOCAL_NUMA_PREFIX} ${IB_TOOL} \
         -x ${GID_INDEX} \
         -n ${ITERATIONS} \
         --tclass=${TCLASS} \
@@ -379,12 +411,32 @@ run_single_test() {
 
     check_tool "${IB_TOOL}"
 
+    # 获取 NUMA 节点
+    LOCAL_NUMA=$(get_numa_node "${IB_DEV}")
+    REMOTE_NUMA=$(get_numa_node "${IB_DEV}" "remote")
+
+    # 构建 numactl 前缀（受 --no-numa 控制）
+    LOCAL_NUMA_PREFIX=""
+    REMOTE_NUMA_PREFIX=""
+    if [ "${NUMA_AFFINITY}" = "true" ]; then
+        if [ -n "${LOCAL_NUMA}" ]; then
+            LOCAL_NUMA_PREFIX="numactl --cpunodebind=${LOCAL_NUMA} --membind=${LOCAL_NUMA}"
+        fi
+        if [ -n "${REMOTE_NUMA}" ]; then
+            REMOTE_NUMA_PREFIX="numactl --cpunodebind=${REMOTE_NUMA} --membind=${REMOTE_NUMA}"
+        fi
+    fi
+
     # 初始化文件
     > ${RAW_LOG}
 
     # 构建测试命令字符串
-    local server_cmd="${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s <size>"
-    local client_cmd="${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s <size> ${SERVER_BOND_IP}"
+    local numa_srv_prefix=""
+    [ -n "${REMOTE_NUMA_PREFIX}" ] && numa_srv_prefix="${REMOTE_NUMA_PREFIX} "
+    local numa_cli_prefix=""
+    [ -n "${LOCAL_NUMA_PREFIX}" ] && numa_cli_prefix="${LOCAL_NUMA_PREFIX} "
+    local server_cmd="${numa_srv_prefix}${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s <size>"
+    local client_cmd="${numa_cli_prefix}${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s <size> ${SERVER_BOND_IP}"
 
     # 写入结果文件头部（仅基本信息）
     {
@@ -398,6 +450,8 @@ run_single_test() {
         echo "# Server 业务IP: ${SERVER_BOND_IP}"
         echo "# Device       : ${IB_DEV}"
         echo "# 迭代数       : ${ITERATIONS}"
+        echo "# Client NUMA  : ${LOCAL_NUMA:-N/A}"
+        echo "# Server NUMA  : ${REMOTE_NUMA:-N/A}"
         echo "########################################"
         echo ""
     } > ${RESULT_FILE}
@@ -416,6 +470,8 @@ run_single_test() {
         echo "# tclass       : ${TCLASS}"
         echo "# GID          : ${GID_INDEX}"
         echo "# 迭代数       : ${ITERATIONS}"
+        echo "# Client NUMA  : ${LOCAL_NUMA:-N/A}"
+        echo "# Server NUMA  : ${REMOTE_NUMA:-N/A}"
         echo "#"
         echo "# 测试命令:"
         echo "#   [Server端] ${server_cmd}"
@@ -427,6 +483,8 @@ run_single_test() {
     # 终端打印信息
     echo ""
     echo -e "${BLUE}========== ${IB_TOOL} ==========${NC}"
+    echo "Client NUMA  : ${LOCAL_NUMA:-N/A}"
+    echo "Server NUMA  : ${REMOTE_NUMA:-N/A}"
     echo "结果文件     : ${RESULT_FILE}"
     echo ""
 
