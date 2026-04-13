@@ -1,0 +1,28 @@
+[CONTINUOUS]
+hosts=10.36.33.110:mlx5_bond_2,10.36.33.111:mlx5_bond_2,10.36.33.112:mlx5_bond_2,10.36.33.113:mlx5_bond_2,10.36.33.167:mlx5_bond_2,10.36.33.168:mlx5_bond_2,10.36.33.169:mlx5_bond_2,10.36.33.170:mlx5_bond_2
+servers=4
+cmds=/opt/pg1-tests/perftest/bin/ib_write_bw -F --report_gbits --ib-dev=%s -x 3 --run_infinitely -D 1 -p %d -q %d
+qp=16
+report=/tmp/shuttle
+port=8200
+duration=30
+gdr=false
+
+[LATENCY]
+hosts=10.36.33.110:mlx5_bond_2,10.36.33.111:mlx5_bond_2,10.36.33.112:mlx5_bond_2,10.36.33.113:mlx5_bond_2,10.36.33.167:mlx5_bond_2,10.36.33.168:mlx5_bond_2,10.36.33.169:mlx5_bond_2,10.36.33.170:mlx5_bond_2
+cmds=ib_write_lat -F --ib-dev=%s -x 3 -p %d
+report=/tmp/shuttle
+port=8200
+
+[NCCL]
+hosts=10.36.33.110,10.36.33.111,10.36.33.112,10.36.33.113,10.36.33.167,10.36.33.168,10.36.33.169,10.36.33.170
+cmds=/usr/local/bin/all_reduce_perf -b 2g -e 2g -n 100
+env=NCCL_IB_TC=136 NCCL_IB_SL=5 NCCL_IB_GID_INDEX=3 NCCL_SOCKET_IFNAME=bond0 NCCL_DEBUG=INFO NCCL_IB_HCA=mlx5 NCCL_MIN_NCHANNELS=4 NCCL_IB_QPS_PER_CONNECTION=4 NCCL_NVLS_ENABLE=1 NCCL_NET_PLUGIN=none
+report=/tmp/shuttle
+port=8200
+
+[PINGMESH]
+hosts=10.36.33.110:mlx5_bond_2,10.36.33.111:mlx5_bond_2,10.36.33.112:mlx5_bond_2,10.36.33.113:mlx5_bond_2,10.36.33.167:mlx5_bond_2,10.36.33.168:mlx5_bond_2,10.36.33.169:mlx5_bond_2,10.36.33.170:mlx5_bond_2
+cmds=rdpingmesh -n 2 
+report=/tmp/shuttle
+port=8200
