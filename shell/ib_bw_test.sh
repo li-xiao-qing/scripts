@@ -20,12 +20,14 @@ usage() {
     echo ""
     echo "选项:"
     echo "  --dual-gpu  启用双卡GDR测试（同bond下2张GPU并行，带宽求和）"
+    echo "  --no-numa   禁用内存测试的NUMA亲和绑定（默认启用）"
     echo ""
     echo "示例:"
     echo "  $0                  # 执行 write/read/send 全部测试"
     echo "  $0 write            # 仅执行 write 测试"
     echo "  $0 --dual-gpu       # 全部测试 + 额外双卡GDR场景(9-12)"
     echo "  $0 --dual-gpu write # 仅 write + 额外双卡GDR场景"
+    echo "  $0 --no-numa        # 全部测试，不绑定NUMA"
     exit 1
 }
 
@@ -33,11 +35,13 @@ usage() {
 # 解析参数
 #===========================================
 DUAL_GPU=false
+NUMA_AFFINITY=true
 TEST_TYPE="all"
 
 while [ $# -gt 0 ]; do
     case $1 in
         --dual-gpu) DUAL_GPU=true; shift ;;
+        --no-numa)  NUMA_AFFINITY=false; shift ;;
         -h|--help)  usage ;;
         all|write|read|send) TEST_TYPE=$1; shift ;;
         *)
@@ -144,6 +148,30 @@ get_server_bond_ip() {
     fi
 
     echo "${bond_ip}"
+}
+
+#===========================================
+# 获取 IB 设备的 NUMA 节点号
+# 参数: ib_dev [remote]
+# 返回: NUMA 节点号，检测失败返回空
+#===========================================
+get_numa_node() {
+    local ib_dev=$1
+    local remote=$2
+
+    local numa_node
+    if [ "${remote}" = "remote" ]; then
+        numa_node=$(ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+            "cat /sys/class/infiniband/${ib_dev}/device/numa_node 2>/dev/null")
+    else
+        numa_node=$(cat /sys/class/infiniband/${ib_dev}/device/numa_node 2>/dev/null)
+    fi
+
+    if [ -z "$numa_node" ] || [ "$numa_node" = "-1" ]; then
+        echo ""
+    else
+        echo "$numa_node"
+    fi
 }
 
 #===========================================
@@ -403,7 +431,17 @@ build_cmd_str() {
     local gid_param
     gid_param=$(build_gid_param "${use_cm}")
 
-    local cmd="${IB_TOOL}"
+    # 内存测试加 numactl 前缀
+    local prefix=""
+    if [ "${use_cuda}" != "cuda" ]; then
+        if [ "${side}" = "server" ] && [ -n "${REMOTE_NUMA_PREFIX}" ]; then
+            prefix="${REMOTE_NUMA_PREFIX} "
+        elif [ "${side}" = "client" ] && [ -n "${LOCAL_NUMA_PREFIX}" ]; then
+            prefix="${LOCAL_NUMA_PREFIX} "
+        fi
+    fi
+
+    local cmd="${prefix}${IB_TOOL}"
     [ -n "${gid_param}" ] && cmd="${cmd} ${gid_param}"
     cmd="${cmd} -D ${DURATION}"
     cmd="${cmd} --tclass=${TCLASS}"
@@ -462,10 +500,14 @@ start_server() {
     local cuda_param=""
     [ "${use_cuda}" = "cuda" ] && cuda_param="--use_cuda=${REMOTE_GPU_ID}"
 
+    # 内存测试使用 numactl 绑定 NUMA 节点
+    local numa_prefix=""
+    [ "${use_cuda}" != "cuda" ] && numa_prefix="${REMOTE_NUMA_PREFIX}"
+
     pssh -H "${SERVER_USER}@${SERVER_IP}" \
          -x "${PSSH_SSH_OPTS}" \
          -t 30 -i \
-         "nohup ${IB_TOOL} \
+         "nohup ${numa_prefix} ${IB_TOOL} \
              ${gid_param} \
              -D ${DURATION} \
              --tclass=${TCLASS} \
@@ -545,9 +587,13 @@ run_client() {
     local cuda_param=""
     [ "${use_cuda}" = "cuda" ] && cuda_param="--use_cuda=${LOCAL_GPU_ID}"
 
+    # 内存测试使用 numactl 绑定 NUMA 节点
+    local numa_prefix=""
+    [ "${use_cuda}" != "cuda" ] && numa_prefix="${LOCAL_NUMA_PREFIX}"
+
     local stderr_tmp=$(mktemp)
     local raw_output
-    raw_output=$(timeout ${CLIENT_TIMEOUT} ${IB_TOOL} \
+    raw_output=$(timeout ${CLIENT_TIMEOUT} ${numa_prefix} ${IB_TOOL} \
         ${gid_param} \
         -D ${DURATION} \
         --tclass=${TCLASS} \
@@ -899,6 +945,22 @@ run_single_test() {
         fi
     fi
 
+    # 获取 NUMA 节点
+    LOCAL_NUMA=$(get_numa_node "${IB_DEV}")
+    REMOTE_NUMA=$(get_numa_node "${IB_DEV}" "remote")
+
+    # 构建 numactl 前缀（仅内存测试使用，受 --no-numa 控制）
+    LOCAL_NUMA_PREFIX=""
+    REMOTE_NUMA_PREFIX=""
+    if [ "${NUMA_AFFINITY}" = "true" ]; then
+        if [ -n "${LOCAL_NUMA}" ]; then
+            LOCAL_NUMA_PREFIX="numactl --cpunodebind=${LOCAL_NUMA} --membind=${LOCAL_NUMA}"
+        fi
+        if [ -n "${REMOTE_NUMA}" ]; then
+            REMOTE_NUMA_PREFIX="numactl --cpunodebind=${REMOTE_NUMA} --membind=${REMOTE_NUMA}"
+        fi
+    fi
+
     # 初始化文件
     > ${RAW_LOG}
 
@@ -916,6 +978,8 @@ run_single_test() {
         echo "# 测试时长     : ${DURATION}s"
         echo "# 消息大小     : ${MSG_SIZE} bytes"
         echo "# QP列表       : ${QPS[*]}"
+        echo "# Client NUMA  : ${LOCAL_NUMA:-N/A}"
+        echo "# Server NUMA  : ${REMOTE_NUMA:-N/A}"
         echo "# GDR可用      : ${GDR_AVAILABLE}"
         if [ "${GDR_AVAILABLE}" = "true" ]; then
             echo "# Client GPU   : ${LOCAL_GPU_IDS[*]}"
@@ -942,6 +1006,8 @@ run_single_test() {
         echo "# 测试时长     : ${DURATION}s"
         echo "# 消息大小     : ${MSG_SIZE} bytes"
         echo "# QP列表       : ${QPS[*]}"
+        echo "# Client NUMA  : ${LOCAL_NUMA:-N/A}"
+        echo "# Server NUMA  : ${REMOTE_NUMA:-N/A}"
         echo "# GDR可用      : ${GDR_AVAILABLE}"
         if [ "${GDR_AVAILABLE}" = "true" ]; then
             echo "# Client GPU   : ${LOCAL_GPU_IDS[*]}"
@@ -981,6 +1047,8 @@ run_single_test() {
     echo -e "${BLUE}========== ${IB_TOOL} ==========${NC}"
     echo "消息大小     : ${MSG_SIZE} bytes"
     echo "QP列表       : ${QPS[*]}"
+    echo "Client NUMA  : ${LOCAL_NUMA:-N/A}"
+    echo "Server NUMA  : ${REMOTE_NUMA:-N/A}"
     echo "GDR可用      : ${GDR_AVAILABLE}"
     if [ "${GDR_AVAILABLE}" = "true" ]; then
         echo "Client GPU   : ${LOCAL_GPU_IDS[*]}"
