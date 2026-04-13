@@ -3,13 +3,14 @@
 # 支持 ib_write_bw / ib_read_bw / ib_send_bw
 # 测试场景: 内存单向 + 内存双向 + 内存单向CM + 内存双向CM
 #           + 显存单向 + 显存双向 + 显存单向CM + 显存双向CM
+#           + (可选) 双卡显存单向/双向/CM
 # 可指定单一类型或 all 执行全部带宽测试
 
 #===========================================
 # 使用方法
 #===========================================
 usage() {
-    echo "用法: $0 [测试类型]"
+    echo "用法: $0 [选项] [测试类型]"
     echo ""
     echo "测试类型:"
     echo "  all     - 依次执行 write/read/send (默认)"
@@ -17,26 +18,34 @@ usage() {
     echo "  read    - ib_read_bw"
     echo "  send    - ib_send_bw"
     echo ""
+    echo "选项:"
+    echo "  --dual-gpu  启用双卡GDR测试（同bond下2张GPU并行，带宽求和）"
+    echo ""
     echo "示例:"
-    echo "  $0          # 执行全部"
-    echo "  $0 all      # 执行全部"
-    echo "  $0 write    # 仅 write"
+    echo "  $0                  # 执行 write/read/send 全部测试"
+    echo "  $0 write            # 仅执行 write 测试"
+    echo "  $0 --dual-gpu       # 全部测试 + 额外双卡GDR场景(9-12)"
+    echo "  $0 --dual-gpu write # 仅 write + 额外双卡GDR场景"
     exit 1
 }
 
 #===========================================
 # 解析参数
 #===========================================
-TEST_TYPE=${1:-"all"}
+DUAL_GPU=false
+TEST_TYPE="all"
 
-case ${TEST_TYPE} in
-    all|write|read|send) ;;
-    -h|--help) usage ;;
-    *)
-        echo "不支持的测试类型: ${TEST_TYPE}"
-        usage
-        ;;
-esac
+while [ $# -gt 0 ]; do
+    case $1 in
+        --dual-gpu) DUAL_GPU=true; shift ;;
+        -h|--help)  usage ;;
+        all|write|read|send) TEST_TYPE=$1; shift ;;
+        *)
+            echo "不支持的参数: $1"
+            usage
+            ;;
+    esac
+done
 
 #===========================================
 # 配置区域
@@ -138,12 +147,12 @@ get_server_bond_ip() {
 }
 
 #===========================================
-# 获取与IB设备亲和的GPU设备号
+# 获取与IB设备亲和的所有GPU设备号
 # 通过 nvidia-smi/ppu-smi topo -m 解析 PIX 关系
 # 参数: ib_dev [remote]
-# 返回: GPU index（默认0）
+# 返回: 空格分隔的 GPU index 列表（至少返回 "0"）
 #===========================================
-get_affinity_gpu() {
+get_affinity_gpus() {
     local ib_dev=$1
     local remote=$2
 
@@ -163,11 +172,10 @@ get_affinity_gpu() {
 
     if [ ! -s "${topo_file}" ]; then
         rm -f "${topo_file}"
-        echo 0
+        echo "0"
         return
     fi
 
-    # 从 NIC Legend 找到 ib_dev 对应的 NIC 名称
     local nic_name=""
     local legend
     legend=$(sed -n '/NIC Legend/,$p' "${topo_file}")
@@ -180,11 +188,10 @@ get_affinity_gpu() {
 
     if [ -z "$nic_name" ]; then
         rm -f "${topo_file}"
-        echo 0
+        echo "0"
         return
     fi
 
-    # 从拓扑矩阵找到 NIC 行
     local nic_row=""
     while IFS= read -r line; do
         local first
@@ -197,11 +204,10 @@ get_affinity_gpu() {
 
     if [ -z "$nic_row" ]; then
         rm -f "${topo_file}"
-        echo 0
+        echo "0"
         return
     fi
 
-    # 找到表头行（第一个包含 GPU/PPU 的非空行）
     local header_line=""
     while IFS= read -r line; do
         if echo "$line" | grep -qiE "(GPU|PPU)[0-9]"; then
@@ -213,11 +219,11 @@ get_affinity_gpu() {
     rm -f "${topo_file}"
 
     if [ -z "$header_line" ]; then
-        echo 0
+        echo "0"
         return
     fi
 
-    # 遍历表头列，找第一个与 NIC 是 PIX 关系的 GPU/PPU
+    local gpu_list=""
     local col_idx=0
     for col_name in $header_line; do
         if echo "$col_name" | grep -qiE "^(GPU|PPU)[0-9]+$"; then
@@ -225,14 +231,19 @@ get_affinity_gpu() {
             local val
             val=$(echo "$nic_row" | awk -v c=${awk_field} '{print $c}')
             if [ "$val" = "PIX" ]; then
-                echo "$col_name" | sed 's/[^0-9]//g'
-                return
+                local gpu_num
+                gpu_num=$(echo "$col_name" | sed 's/[^0-9]//g')
+                gpu_list="${gpu_list:+${gpu_list} }${gpu_num}"
             fi
         fi
         col_idx=$((col_idx + 1))
     done
 
-    echo 0
+    if [ -z "$gpu_list" ]; then
+        echo "0"
+    else
+        echo "$gpu_list"
+    fi
 }
 
 #===========================================
@@ -631,8 +642,203 @@ run_test_group() {
 }
 
 #===========================================
-# Ctrl+C 退出时清理server端残留进程
+# 双卡模式: 启动两个server（不同端口、不同GPU）
+# 参数: qp bidir use_cm
 #===========================================
+start_dual_server() {
+    local qp=$1
+    local bidir=$2
+    local use_cm=$3
+
+    local gid_param
+    gid_param=$(build_gid_param "${use_cm}")
+
+    local base_cmd="${IB_TOOL} ${gid_param} -D ${DURATION} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s ${MSG_SIZE} --qp=${qp} --report_gbits ${bidir} ${use_cm}"
+
+    pssh -H "${SERVER_USER}@${SERVER_IP}" \
+         -x "${PSSH_SSH_OPTS}" \
+         -t 30 -i \
+         "nohup ${base_cmd} --use_cuda=${REMOTE_GPU_ID} \
+             > /tmp/ib_bw_server_qp${qp}_gpu0.log 2>&1 &
+          nohup ${base_cmd} --use_cuda=${REMOTE_GPU_ID2} -p 18516 \
+             > /tmp/ib_bw_server_qp${qp}_gpu1.log 2>&1 &
+          sleep 0.5" &>/dev/null
+}
+
+#===========================================
+# 双卡模式: 验证两个server是否都启动
+# 返回: 0=成功 1=失败
+#===========================================
+verify_dual_server() {
+    local qp=$1
+    local timeout=${SERVER_WAIT_TIMEOUT}
+    local waited=0
+
+    echo "=== verify_dual_server qp=${qp} ===" >> ${RAW_LOG}
+
+    while [ ${waited} -lt ${timeout} ]; do
+        local pid_count
+        pid_count=$(ssh ${SSH_OPTS} \
+            ${SERVER_USER}@${SERVER_IP} \
+            "pgrep -fc '${IB_TOOL}'" 2>/dev/null)
+
+        if [ "${pid_count:-0}" -ge 2 ]; then
+            local has_error=false
+            for gpu_idx in 0 1; do
+                local log_status
+                log_status=$(ssh ${SSH_OPTS} \
+                    ${SERVER_USER}@${SERVER_IP} \
+                    "cat /tmp/ib_bw_server_qp${qp}_gpu${gpu_idx}.log 2>/dev/null")
+                if echo "${log_status}" | grep -qiE "error|failed|cannot|unable"; then
+                    echo "[ERROR] dual server gpu${gpu_idx}启动失败 qp=${qp}" >> ${RAW_LOG}
+                    echo "${log_status}" >> ${RAW_LOG}
+                    has_error=true
+                fi
+            done
+            if [ "${has_error}" = "true" ]; then
+                echo -e "${RED}[ERROR] QP=${qp} dual server启动失败，详情见: ${RAW_LOG}${NC}" >&2
+                return 1
+            fi
+            echo "dual server已启动 count=${pid_count} waited=${waited}s" >> ${RAW_LOG}
+            return 0
+        fi
+
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    for gpu_idx in 0 1; do
+        local timeout_log
+        timeout_log=$(ssh ${SSH_OPTS} \
+            ${SERVER_USER}@${SERVER_IP} \
+            "cat /tmp/ib_bw_server_qp${qp}_gpu${gpu_idx}.log 2>/dev/null")
+        echo "[ERROR] dual server gpu${gpu_idx} 超时 qp=${qp}" >> ${RAW_LOG}
+        echo "${timeout_log}" >> ${RAW_LOG}
+    done
+    echo -e "${RED}[ERROR] QP=${qp} dual server启动超时，详情见: ${RAW_LOG}${NC}" >&2
+    return 1
+}
+
+#===========================================
+# 双卡模式: 并行执行两个client，返回带宽之和
+# 参数: qp bidir use_cm
+#===========================================
+run_dual_client() {
+    local qp=$1
+    local bidir=$2
+    local use_cm=$3
+
+    local gid_param
+    gid_param=$(build_gid_param "${use_cm}")
+
+    local base_args="${gid_param} -D ${DURATION} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s ${MSG_SIZE} --qp=${qp} --report_gbits ${bidir} ${use_cm}"
+
+    local out1 out2 stderr1 stderr2
+    out1=$(mktemp); out2=$(mktemp)
+    stderr1=$(mktemp); stderr2=$(mktemp)
+
+    timeout ${CLIENT_TIMEOUT} ${IB_TOOL} ${base_args} \
+        --use_cuda=${LOCAL_GPU_ID} \
+        ${SERVER_BOND_IP} >"${out1}" 2>"${stderr1}" &
+    local pid1=$!
+
+    timeout ${CLIENT_TIMEOUT} ${IB_TOOL} ${base_args} \
+        --use_cuda=${LOCAL_GPU_ID2} -p 18516 \
+        ${SERVER_BOND_IP} >"${out2}" 2>"${stderr2}" &
+    local pid2=$!
+
+    wait ${pid1}; local rc1=$?
+    wait ${pid2}; local rc2=$?
+
+    {
+        echo "=== dual_client qp=${qp} gpu0=${LOCAL_GPU_ID} rc=${rc1} ==="
+        cat "${out1}"
+        [ -s "${stderr1}" ] && { echo "--- stderr ---"; cat "${stderr1}"; }
+        echo "=== dual_client qp=${qp} gpu1=${LOCAL_GPU_ID2} rc=${rc2} ==="
+        cat "${out2}"
+        [ -s "${stderr2}" ] && { echo "--- stderr ---"; cat "${stderr2}"; }
+    } >> ${RAW_LOG}
+
+    local bw1="" bw2=""
+
+    if [ ${rc1} -eq 124 ]; then
+        echo -e "${RED}[ERROR] QP=${qp} GPU${LOCAL_GPU_ID} client超时(${CLIENT_TIMEOUT}s)${NC}" >&2
+    elif [ ${rc1} -eq 0 ]; then
+        bw1=$(grep -E "^[[:space:]]*[0-9]+" "${out1}" | grep -v "^[[:space:]]*#" | awk '{print $4}' | tail -1)
+    fi
+
+    if [ ${rc2} -eq 124 ]; then
+        echo -e "${RED}[ERROR] QP=${qp} GPU${LOCAL_GPU_ID2} client超时(${CLIENT_TIMEOUT}s)${NC}" >&2
+    elif [ ${rc2} -eq 0 ]; then
+        bw2=$(grep -E "^[[:space:]]*[0-9]+" "${out2}" | grep -v "^[[:space:]]*#" | awk '{print $4}' | tail -1)
+    fi
+
+    rm -f "${out1}" "${out2}" "${stderr1}" "${stderr2}"
+
+    if [ ${rc1} -eq 124 ] || [ ${rc2} -eq 124 ]; then
+        echo "TIMEOUT"
+        return 0
+    fi
+
+    if [ -n "$bw1" ] && [ -n "$bw2" ]; then
+        awk "BEGIN{printf \"%.2f\", ${bw1}+${bw2}}"
+    elif [ -n "$bw1" ]; then
+        echo "$bw1"
+    elif [ -n "$bw2" ]; then
+        echo "$bw2"
+    else
+        echo "N/A"
+    fi
+}
+
+#===========================================
+# 双卡模式: 运行一组测试（遍历所有QP）
+# 参数: label bidir use_cm
+#===========================================
+run_dual_test_group() {
+    local label=$1
+    local bidir=$2
+    local use_cm=$3
+
+    local bw_values=()
+    local total=${#QPS[@]}
+    local idx=0
+
+    for qp in "${QPS[@]}"; do
+        idx=$((idx + 1))
+        echo -ne "${YELLOW}  [${idx}/${total}] QP=${qp} 双卡测试中...${NC}\r" >&2
+
+        start_dual_server ${qp} "${bidir}" "${use_cm}"
+
+        if ! verify_dual_server ${qp}; then
+            printf "\r\033[2K" >&2
+            echo -e "${RED}  [${idx}/${total}] QP=${qp} dual server启动失败，跳过${NC}" >&2
+            bw_values+=("ERR")
+            kill_server
+            continue
+        fi
+
+        local bw
+        bw=$(run_dual_client ${qp} "${bidir}" "${use_cm}")
+        kill_server
+
+        bw_values+=("${bw}")
+        printf "\r\033[2K" >&2
+        if [ "${bw}" = "TIMEOUT" ] || [ "${bw}" = "N/A" ] || [ "${bw}" = "ERR" ]; then
+            printf "  QP=%s: %s\n" "${qp}" "${bw}" >&2
+        else
+            printf "  QP=%s: %s Gbps\n" "${qp}" "${bw}" >&2
+        fi
+    done
+
+    echo ""
+    print_row "${label}" "${bw_values[@]}"
+    print_row "${label}" "${bw_values[@]}" >> ${RESULT_FILE}
+}
+
+#===========================================
+# Ctrl+C 退出时清理server端残留进程
+#=========================================== 
 cleanup_on_exit() {
     echo ""
     echo -e "${YELLOW}[INFO] 捕获到中断信号，正在清理本地和server端进程...${NC}"
@@ -673,8 +879,24 @@ run_single_test() {
 
     # 在父shell中获取GPU ID（避免子shell变量丢失）
     if [ "${GDR_AVAILABLE}" = "true" ]; then
-        LOCAL_GPU_ID=$(get_affinity_gpu "${IB_DEV}")
-        REMOTE_GPU_ID=$(get_affinity_gpu "${IB_DEV}" "remote")
+        local local_gpu_str remote_gpu_str
+        local_gpu_str=$(get_affinity_gpus "${IB_DEV}")
+        remote_gpu_str=$(get_affinity_gpus "${IB_DEV}" "remote")
+        read -ra LOCAL_GPU_IDS <<< "$local_gpu_str"
+        read -ra REMOTE_GPU_IDS <<< "$remote_gpu_str"
+        LOCAL_GPU_ID=${LOCAL_GPU_IDS[0]}
+        REMOTE_GPU_ID=${REMOTE_GPU_IDS[0]}
+
+        DUAL_GPU_OK=false
+        if [ "${DUAL_GPU}" = "true" ]; then
+            if [ ${#LOCAL_GPU_IDS[@]} -ge 2 ] && [ ${#REMOTE_GPU_IDS[@]} -ge 2 ]; then
+                DUAL_GPU_OK=true
+                LOCAL_GPU_ID2=${LOCAL_GPU_IDS[1]}
+                REMOTE_GPU_ID2=${REMOTE_GPU_IDS[1]}
+            else
+                echo -e "${RED}[WARN] 亲和GPU不足2张(本机:${#LOCAL_GPU_IDS[@]}, server:${#REMOTE_GPU_IDS[@]})，跳过双卡GDR测试${NC}" >&2
+            fi
+        fi
     fi
 
     # 初始化文件
@@ -696,8 +918,9 @@ run_single_test() {
         echo "# QP列表       : ${QPS[*]}"
         echo "# GDR可用      : ${GDR_AVAILABLE}"
         if [ "${GDR_AVAILABLE}" = "true" ]; then
-            echo "# Client GPU   : ${LOCAL_GPU_ID}"
-            echo "# Server GPU   : ${REMOTE_GPU_ID}"
+            echo "# Client GPU   : ${LOCAL_GPU_IDS[*]}"
+            echo "# Server GPU   : ${REMOTE_GPU_IDS[*]}"
+            echo "# 双卡模式     : ${DUAL_GPU_OK}"
         fi
         echo "########################################"
         echo ""
@@ -721,8 +944,9 @@ run_single_test() {
         echo "# QP列表       : ${QPS[*]}"
         echo "# GDR可用      : ${GDR_AVAILABLE}"
         if [ "${GDR_AVAILABLE}" = "true" ]; then
-            echo "# Client GPU   : ${LOCAL_GPU_ID}"
-            echo "# Server GPU   : ${REMOTE_GPU_ID}"
+            echo "# Client GPU   : ${LOCAL_GPU_IDS[*]}"
+            echo "# Server GPU   : ${REMOTE_GPU_IDS[*]}"
+            echo "# 双卡模式     : ${DUAL_GPU_OK}"
         fi
         echo "#"
         echo "# 测试场景及对应命令:"
@@ -739,6 +963,15 @@ run_single_test() {
             echo "# (场景5-8 已跳过，GPU不可用)"
             echo "#"
         fi
+        if [ "${DUAL_GPU_OK}" = "true" ]; then
+            echo "#"
+            echo "# 双卡GDR场景 (GPU ${LOCAL_GPU_ID}+${LOCAL_GPU_ID2} / ${REMOTE_GPU_ID}+${REMOTE_GPU_ID2}, 端口 18515+18516):"
+            echo "#   场景9  [双卡显存单向]:    2x server + 2x client, 带宽求和"
+            echo "#   场景10 [双卡显存双向]:    同上 + --bidirectional"
+            echo "#   场景11 [双卡显存单向 CM]: 同上 + -R"
+            echo "#   场景12 [双卡显存双向 CM]: 同上 + --bidirectional -R"
+            echo "#"
+        fi
         echo "########################################"
         echo ""
     } >> ${RAW_LOG}
@@ -750,8 +983,11 @@ run_single_test() {
     echo "QP列表       : ${QPS[*]}"
     echo "GDR可用      : ${GDR_AVAILABLE}"
     if [ "${GDR_AVAILABLE}" = "true" ]; then
-        echo "Client GPU   : ${LOCAL_GPU_ID}"
-        echo "Server GPU   : ${REMOTE_GPU_ID}"
+        echo "Client GPU   : ${LOCAL_GPU_IDS[*]}"
+        echo "Server GPU   : ${REMOTE_GPU_IDS[*]}"
+        if [ "${DUAL_GPU_OK}" = "true" ]; then
+            echo "双卡模式     : 启用 (GPU ${LOCAL_GPU_ID}+${LOCAL_GPU_ID2})"
+        fi
     fi
     echo "结果文件     : ${RESULT_FILE}"
     echo ""
@@ -765,51 +1001,54 @@ run_single_test() {
     echo "$header"
     echo "$header" >> ${RESULT_FILE}
 
+    local total_scenes=8
+    [ "${DUAL_GPU_OK}" = "true" ] && total_scenes=12
+
     # 1. 内存单向
     echo ""
-    echo -e "${BLUE}--- 1/8 内存单向 ---${NC}"
+    echo -e "${BLUE}--- 1/${total_scenes} 内存单向 ---${NC}"
     echo "# 1. 内存单向" >> ${RAW_LOG}
     run_test_group "Mem-Uni" "" "" ""
 
     # 2. 内存双向
     echo ""
-    echo -e "${BLUE}--- 2/8 内存双向 ---${NC}"
+    echo -e "${BLUE}--- 2/${total_scenes} 内存双向 ---${NC}"
     echo "# 2. 内存双向" >> ${RAW_LOG}
     run_test_group "Mem-Bidi" "--bidirectional" "" ""
 
     # 3. 内存单向 CM
     echo ""
-    echo -e "${BLUE}--- 3/8 内存单向 CM ---${NC}"
+    echo -e "${BLUE}--- 3/${total_scenes} 内存单向 CM ---${NC}"
     echo "# 3. 内存单向 CM" >> ${RAW_LOG}
     run_test_group "Mem-Uni-CM" "" "" "-R"
 
     # 4. 内存双向 CM
     echo ""
-    echo -e "${BLUE}--- 4/8 内存双向 CM ---${NC}"
+    echo -e "${BLUE}--- 4/${total_scenes} 内存双向 CM ---${NC}"
     echo "# 4. 内存双向 CM" >> ${RAW_LOG}
     run_test_group "Mem-Bidi-CM" "--bidirectional" "" "-R"
 
-    # 5-8. 显存测试
+    # 5-8. 单卡显存测试
     if [ "${GDR_AVAILABLE}" = "true" ]; then
         local gpu_info="Client GPU ${LOCAL_GPU_ID}, Server GPU ${REMOTE_GPU_ID}"
 
         echo ""
-        echo -e "${BLUE}--- 5/8 显存单向 (${gpu_info}) ---${NC}"
+        echo -e "${BLUE}--- 5/${total_scenes} 显存单向 (${gpu_info}) ---${NC}"
         echo "# 5. 显存单向" >> ${RAW_LOG}
         run_test_group "GDR-Uni" "" "cuda" ""
 
         echo ""
-        echo -e "${BLUE}--- 6/8 显存双向 (${gpu_info}) ---${NC}"
+        echo -e "${BLUE}--- 6/${total_scenes} 显存双向 (${gpu_info}) ---${NC}"
         echo "# 6. 显存双向" >> ${RAW_LOG}
         run_test_group "GDR-Bidi" "--bidirectional" "cuda" ""
 
         echo ""
-        echo -e "${BLUE}--- 7/8 显存单向 CM (${gpu_info}) ---${NC}"
+        echo -e "${BLUE}--- 7/${total_scenes} 显存单向 CM (${gpu_info}) ---${NC}"
         echo "# 7. 显存单向 CM" >> ${RAW_LOG}
         run_test_group "GDR-Uni-CM" "" "cuda" "-R"
 
         echo ""
-        echo -e "${BLUE}--- 8/8 显存双向 CM (${gpu_info}) ---${NC}"
+        echo -e "${BLUE}--- 8/${total_scenes} 显存双向 CM (${gpu_info}) ---${NC}"
         echo "# 8. 显存双向 CM" >> ${RAW_LOG}
         run_test_group "GDR-Bidi-CM" "--bidirectional" "cuda" "-R"
     else
@@ -821,6 +1060,31 @@ run_single_test() {
             echo "# 7. 显存单向 CM (跳过)"
             echo "# 8. 显存双向 CM (跳过)"
         } >> ${RAW_LOG}
+    fi
+
+    # 9-12. 双卡显存测试
+    if [ "${DUAL_GPU_OK}" = "true" ]; then
+        local dual_info="Client GPU ${LOCAL_GPU_ID}+${LOCAL_GPU_ID2}, Server GPU ${REMOTE_GPU_ID}+${REMOTE_GPU_ID2}"
+
+        echo ""
+        echo -e "${BLUE}--- 9/${total_scenes} 双卡显存单向 (${dual_info}) ---${NC}"
+        echo "# 9. 双卡显存单向" >> ${RAW_LOG}
+        run_dual_test_group "2GPU-Uni" "" ""
+
+        echo ""
+        echo -e "${BLUE}--- 10/${total_scenes} 双卡显存双向 (${dual_info}) ---${NC}"
+        echo "# 10. 双卡显存双向" >> ${RAW_LOG}
+        run_dual_test_group "2GPU-Bidi" "--bidirectional" ""
+
+        echo ""
+        echo -e "${BLUE}--- 11/${total_scenes} 双卡显存单向 CM (${dual_info}) ---${NC}"
+        echo "# 11. 双卡显存单向 CM" >> ${RAW_LOG}
+        run_dual_test_group "2GPU-Uni-CM" "" "-R"
+
+        echo ""
+        echo -e "${BLUE}--- 12/${total_scenes} 双卡显存双向 CM (${dual_info}) ---${NC}"
+        echo "# 12. 双卡显存双向 CM" >> ${RAW_LOG}
+        run_dual_test_group "2GPU-Bidi-CM" "--bidirectional" "-R"
     fi
 
     # 打印完整汇总表
