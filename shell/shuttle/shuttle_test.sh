@@ -8,13 +8,13 @@
 #
 # OPTIONS:
 #   -h, --help              显示帮助信息
-#   -s, --shuttle PATH      shuttle二进制路径 (默认: ./shuttle)
-#   -c, --config-dir DIR    配置文件目录 (默认: 当前目录)
-#   -r, --result-dir DIR    结果输出目录 (默认: ./shuttle_result)
 #   -t, --type TYPE         测试类型: incast, m2n, all2all, all (默认: all)
 #   -m, --mode MODE         测试模式: mem, gdr, all (默认: all)
 #   -q, --qp-list LIST      QP列表, 逗号分隔 (默认: 1,4,8,16,32,64,128,256,512)
 #   -d, --duration SEC      每个测试case的持续时间(秒) (默认: 30)
+#   -s, --shuttle PATH      shuttle二进制路径 (默认: ./shuttle)
+#   -c, --config-dir DIR    配置文件目录 (默认: 当前目录)
+#   -r, --result-dir DIR    结果输出目录 (默认: ./shuttle_result)
 #   --no-bind               禁用网卡绑核（默认启用 -bind，保证CPU亲和性）
 #   --dry-run               仅显示要执行的命令, 不实际运行
 #
