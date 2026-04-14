@@ -16,13 +16,14 @@ usage() {
     echo "  send    - ib_send_lat"
     echo ""
     echo "选项:"
-    echo "  --no-numa   禁用CPU NUMA亲和绑定（默认启用）"
+    echo "  --no-numa         禁用NUMA亲和绑定（默认启用）"
+    echo "  --no-gpu-affinity 禁用网卡-显卡亲和检测（预留，当前延迟测试无GDR场景）"
     echo ""
     echo "示例:"
     echo "  $0          # 执行全部"
     echo "  $0 all      # 执行全部"
     echo "  $0 write    # 仅 write"
-    echo "  $0 --no-numa        # 全部测试，不绑定CPU NUMA亲和"
+    echo "  $0 --no-numa        # 全部测试，不绑定NUMA"
     exit 1
 }
 
@@ -30,11 +31,13 @@ usage() {
 # 解析参数
 #===========================================
 NUMA_AFFINITY=true
+GPU_AFFINITY=true
 TEST_TYPE="all"
 
 while [ $# -gt 0 ]; do
     case $1 in
-        --no-numa)  NUMA_AFFINITY=false; shift ;;
+        --no-numa)         NUMA_AFFINITY=false; shift ;;
+        --no-gpu-affinity) GPU_AFFINITY=false; shift ;;
         -h|--help)  usage ;;
         all|write|read|send) TEST_TYPE=$1; shift ;;
         *)
@@ -47,7 +50,7 @@ done
 #===========================================
 # 配置区域
 #===========================================
-SERVER_IP="10.36.32.195"     # 管理IP，仅用于SSH登录
+SERVER_IP="10.36.33.110"     # 管理IP，仅用于SSH登录
 SERVER_USER="root"
 IB_DEV="mlx5_bond_2"
 TCLASS="16"
@@ -249,7 +252,8 @@ kill_server() {
     pssh -H "${SERVER_USER}@${SERVER_IP}" \
          -t 10 -i \
          -x "${PSSH_OPTS}" \
-         "pkill -f ${IB_TOOL} 2>/dev/null; sleep 0.5" &>/dev/null
+         "pkill -f ${IB_TOOL} 2>/dev/null; wait 2>/dev/null; sleep 0.5" &>/dev/null
+    wait 2>/dev/null
 }
 
 #===========================================
@@ -452,6 +456,7 @@ run_single_test() {
         echo "# 迭代数       : ${ITERATIONS}"
         echo "# Client NUMA  : ${LOCAL_NUMA:-N/A}"
         echo "# Server NUMA  : ${REMOTE_NUMA:-N/A}"
+        echo "# NUMA绑定    : ${NUMA_AFFINITY}"
         echo "########################################"
         echo ""
     } > ${RESULT_FILE}
@@ -472,6 +477,7 @@ run_single_test() {
         echo "# 迭代数       : ${ITERATIONS}"
         echo "# Client NUMA  : ${LOCAL_NUMA:-N/A}"
         echo "# Server NUMA  : ${REMOTE_NUMA:-N/A}"
+        echo "# NUMA绑定    : ${NUMA_AFFINITY}"
         echo "#"
         echo "# 测试命令:"
         echo "#   [Server端] ${server_cmd}"
@@ -485,11 +491,12 @@ run_single_test() {
     echo -e "${BLUE}========== ${IB_TOOL} ==========${NC}"
     echo "Client NUMA  : ${LOCAL_NUMA:-N/A}"
     echo "Server NUMA  : ${REMOTE_NUMA:-N/A}"
+    echo "NUMA绑定     : ${NUMA_AFFINITY}"
     echo "结果文件     : ${RESULT_FILE}"
     echo ""
 
     # 清理残留进程
-    kill_server
+    kill_server 2>/dev/null
 
     # 打印表头（终端+文件）
     local header
@@ -511,13 +518,13 @@ run_single_test() {
             printf "%-12s %-14s %-14s %-14s %-18s %-14s %-16s %-24s %-s\n" \
                 "${size}" "-" "ERR" "ERR" "ERR" "ERR" "ERR" "ERR" "ERR" \
                 | tee -a ${RESULT_FILE}
-            kill_server
+            kill_server 2>/dev/null
             continue
         fi
 
         run_client ${size}
         local client_rc=$?
-        kill_server
+        kill_server 2>/dev/null
         if [ ${client_rc} -eq 124 ]; then
             continue
         fi
