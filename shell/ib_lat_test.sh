@@ -7,23 +7,23 @@
 # 使用方法
 #===========================================
 usage() {
-    echo "用法: $0 [选项] [测试类型]"
-    echo ""
-    echo "测试类型:"
-    echo "  all     - 依次执行 write/read/send (默认)"
-    echo "  write   - ib_write_lat"
-    echo "  read    - ib_read_lat"
-    echo "  send    - ib_send_lat"
+    echo "用法: $0 [选项]"
     echo ""
     echo "选项:"
+    echo "  -t TYPE           测试类型: all(默认)/write/read/send"
+    echo "  --gdr             启用GDR时延测试（默认仅内存测试）"
+    echo "  --no-gpu-affinity 禁用网卡-显卡亲和检测，GDR使用GPU 0（默认启用亲和）"
     echo "  --no-numa         禁用NUMA亲和绑定（默认启用）"
-    echo "  --no-gpu-affinity 禁用网卡-显卡亲和检测（预留，当前延迟测试无GDR场景）"
+    echo "  --perftest-path PATH  指定perftest工具目录（如 /opt/pg1-tests/perftest/bin）"
+    echo "                        默认使用系统PATH中的perftest"
     echo ""
     echo "示例:"
-    echo "  $0          # 执行全部"
-    echo "  $0 all      # 执行全部"
-    echo "  $0 write    # 仅 write"
-    echo "  $0 --no-numa        # 全部测试，不绑定NUMA"
+    echo "  $0                # 执行全部（仅内存）"
+    echo "  $0 --gdr          # 执行全部（内存+GDR）"
+    echo "  $0 -t write       # 仅 write"
+    echo "  $0 -t read --gdr  # 仅 read（内存+GDR）"
+    echo "  $0 --no-numa      # 全部测试，不绑定NUMA"
+    echo "  $0 --perftest-path /opt/pg1-tests/perftest/bin"
     exit 1
 }
 
@@ -32,14 +32,18 @@ usage() {
 #===========================================
 NUMA_AFFINITY=true
 GPU_AFFINITY=true
+ENABLE_GDR=false
+PERFTEST_PATH=""
 TEST_TYPE="all"
 
 while [ $# -gt 0 ]; do
     case $1 in
+        -t)                TEST_TYPE="$2"; shift 2 ;;
+        --gdr)             ENABLE_GDR=true; shift ;;
         --no-numa)         NUMA_AFFINITY=false; shift ;;
         --no-gpu-affinity) GPU_AFFINITY=false; shift ;;
+        --perftest-path)   PERFTEST_PATH="$2"; shift 2 ;;
         -h|--help)  usage ;;
-        all|write|read|send) TEST_TYPE=$1; shift ;;
         *)
             echo "不支持的参数: $1"
             usage
@@ -47,24 +51,26 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+case ${TEST_TYPE} in
+    all|write|read|send) ;;
+    *) echo "不支持的测试类型: ${TEST_TYPE}"; usage ;;
+esac
+
 #===========================================
 # 配置区域
 #===========================================
-SERVER_IP="10.36.33.110"     # 管理IP，仅用于SSH登录
+SERVER_IP="10.36.33.111"     # 管理IP，仅用于SSH登录
 SERVER_USER="root"
 IB_DEV="mlx5_bond_2"
 TCLASS="16"
 GID_INDEX="3"
-ITERATIONS="1000"
+ITERATIONS="10000"
 SERVER_WAIT_TIMEOUT=10
-CLIENT_TIMEOUT=60
+CLIENT_TIMEOUT=300
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_DIR="./ib_lat_result"
 mkdir -p "${OUTPUT_DIR}"
-
-SIZES=(2 4 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 \
-       32768 65536 131072 262144 524288 1048576 2097152 4194304 8388608)
 
 #===========================================
 # 颜色定义
@@ -170,6 +176,157 @@ get_numa_node() {
 }
 
 #===========================================
+# 获取与IB设备亲和的GPU设备号
+# 通过 nvidia-smi/ppu-smi topo -m 解析 PIX 关系
+# 参数: ib_dev [remote]
+# 返回: GPU index（默认 "0"）
+#===========================================
+get_affinity_gpus() {
+    local ib_dev=$1
+    local remote=$2
+
+    local topo_file
+    topo_file=$(mktemp)
+
+    if [ "${remote}" = "remote" ]; then
+        ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+            'if command -v ppu-smi &>/dev/null; then ppu-smi topo -m 2>/dev/null; elif command -v nvidia-smi &>/dev/null; then nvidia-smi topo -m 2>/dev/null; fi' > "${topo_file}"
+    else
+        if command -v ppu-smi &>/dev/null; then
+            ppu-smi topo -m > "${topo_file}" 2>/dev/null
+        elif command -v nvidia-smi &>/dev/null; then
+            nvidia-smi topo -m > "${topo_file}" 2>/dev/null
+        fi
+    fi
+
+    if [ ! -s "${topo_file}" ]; then
+        rm -f "${topo_file}"
+        echo "0"
+        return
+    fi
+
+    local nic_name=""
+    local legend
+    legend=$(sed -n '/NIC Legend/,$p' "${topo_file}")
+    while IFS= read -r line; do
+        if echo "$line" | grep -q "${ib_dev}"; then
+            nic_name=$(echo "$line" | awk -F: '{print $1}' | tr -d ' ')
+            break
+        fi
+    done <<< "$legend"
+
+    if [ -z "$nic_name" ]; then
+        rm -f "${topo_file}"
+        echo "0"
+        return
+    fi
+
+    local nic_row=""
+    while IFS= read -r line; do
+        local first
+        first=$(echo "$line" | awk '{print $1}')
+        if [ "$first" = "$nic_name" ]; then
+            nic_row="$line"
+            break
+        fi
+    done < "${topo_file}"
+
+    if [ -z "$nic_row" ]; then
+        rm -f "${topo_file}"
+        echo "0"
+        return
+    fi
+
+    local header_line=""
+    while IFS= read -r line; do
+        if echo "$line" | grep -qiE "(GPU|PPU)[0-9]"; then
+            header_line="$line"
+            break
+        fi
+    done < "${topo_file}"
+
+    rm -f "${topo_file}"
+
+    if [ -z "$header_line" ]; then
+        echo "0"
+        return
+    fi
+
+    local col_idx=0
+    for col_name in $header_line; do
+        if echo "$col_name" | grep -qiE "^(GPU|PPU)[0-9]+$"; then
+            local awk_field=$((col_idx + 2))
+            local val
+            val=$(echo "$nic_row" | awk -v c=${awk_field} '{print $c}')
+            if [ "$val" = "PIX" ]; then
+                local gpu_num
+                gpu_num=$(echo "$col_name" | sed 's/[^0-9]//g')
+                echo "$gpu_num"
+                return
+            fi
+        fi
+        col_idx=$((col_idx + 1))
+    done
+
+    echo "0"
+}
+
+#===========================================
+# 检查CUDA/GDR环境
+# 返回: true / false
+#===========================================
+check_gdr() {
+    local local_smi="" remote_smi=""
+
+    if command -v ppu-smi &>/dev/null; then
+        local_smi="ppu-smi"
+    elif command -v nvidia-smi &>/dev/null; then
+        local_smi="nvidia-smi"
+    else
+        echo -e "${RED}[WARN] 本机未找到nvidia-smi/ppu-smi，将跳过GDR测试${NC}" >&2
+        echo "false"; return
+    fi
+
+    local gpu_count
+    if [ "${local_smi}" = "ppu-smi" ]; then
+        gpu_count=$(ppu-smi -q 2>/dev/null | grep -c "PPU UUID" || echo 0)
+    else
+        gpu_count=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+    fi
+    if [ "${gpu_count}" -eq 0 ]; then
+        echo -e "${RED}[WARN] 本机未检测到GPU/PPU，将跳过GDR测试${NC}" >&2
+        echo "false"; return
+    fi
+
+    remote_smi=$(ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+        'if command -v ppu-smi &>/dev/null; then echo ppu-smi; elif command -v nvidia-smi &>/dev/null; then echo nvidia-smi; fi' 2>/dev/null)
+    if [ -z "${remote_smi}" ]; then
+        echo -e "${RED}[WARN] server端未找到nvidia-smi/ppu-smi，将跳过GDR测试${NC}" >&2
+        echo "false"; return
+    fi
+
+    local server_gpu_count
+    if [ "${remote_smi}" = "ppu-smi" ]; then
+        server_gpu_count=$(ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+            "ppu-smi -q 2>/dev/null | grep -c 'PPU UUID' || echo 0" 2>/dev/null)
+    else
+        server_gpu_count=$(ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+            "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l")
+    fi
+    if [ "${server_gpu_count}" -eq 0 ]; then
+        echo -e "${RED}[WARN] server端未检测到GPU/PPU，将跳过GDR测试${NC}" >&2
+        echo "false"; return
+    fi
+
+    if ! ${IB_TOOL} --help 2>&1 | grep -q "use_cuda"; then
+        echo -e "${RED}[WARN] 本机perftest未编译CUDA支持，将跳过GDR测试${NC}" >&2
+        echo "false"; return
+    fi
+
+    echo "true"
+}
+
+#===========================================
 # 打印表头
 #===========================================
 print_header() {
@@ -232,16 +389,28 @@ check_ssh() {
 #===========================================
 check_tool() {
     local tool=$1
-    if ! command -v ${tool} &> /dev/null; then
-        echo -e "${RED}[ERROR] 本机未找到 ${tool}，请安装 perftest${NC}"
-        exit 1
-    fi
-    ssh ${SSH_OPTS} \
-        ${SERVER_USER}@${SERVER_IP} \
-        "command -v ${tool}" &>/dev/null
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}[ERROR] server端未找到 ${tool}，请安装 perftest${NC}"
-        exit 1
+    if [[ "${tool}" == /* ]]; then
+        if [ ! -x "${tool}" ]; then
+            echo -e "${RED}[ERROR] 本机未找到 ${tool}${NC}"
+            exit 1
+        fi
+        ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+            "test -x ${tool}" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}[ERROR] server端未找到 ${tool}${NC}"
+            exit 1
+        fi
+    else
+        if ! command -v ${tool} &> /dev/null; then
+            echo -e "${RED}[ERROR] 本机未找到 ${tool}，请安装 perftest${NC}"
+            exit 1
+        fi
+        ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+            "command -v ${tool}" &>/dev/null
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}[ERROR] server端未找到 ${tool}，请安装 perftest${NC}"
+            exit 1
+        fi
     fi
 }
 
@@ -257,10 +426,14 @@ kill_server() {
 }
 
 #===========================================
-# 启动server端
+# 启动server端（-a 模式，所有size一次性测完）
+# 参数: [use_cuda]  - "cuda" 表示使用GDR
 #===========================================
 start_server() {
-    local size=$1
+    local use_cuda=$1
+    local cuda_param=""
+    [ "${use_cuda}" = "cuda" ] && cuda_param="--use_cuda=${REMOTE_GPU_ID}"
+
     pssh -H "${SERVER_USER}@${SERVER_IP}" \
          -t 30 -i \
          -x "${PSSH_OPTS}" \
@@ -269,8 +442,9 @@ start_server() {
              -n ${ITERATIONS} \
              --tclass=${TCLASS} \
              --ib-dev=${IB_DEV} \
-             -s ${size} \
-             > /tmp/ib_lat_server_${size}.log 2>&1 &
+             -a -F \
+             ${cuda_param} \
+             > /tmp/ib_lat_server.log 2>&1 &
           sleep 0.5" &>/dev/null
 }
 
@@ -279,11 +453,10 @@ start_server() {
 # 返回: 0=成功 1=失败
 #===========================================
 verify_server() {
-    local size=$1
     local timeout=${SERVER_WAIT_TIMEOUT}
     local waited=0
 
-    echo "=== verify_server size=${size} ===" >> ${RAW_LOG}
+    echo "=== verify_server ===" >> ${RAW_LOG}
 
     while [ ${waited} -lt ${timeout} ]; do
         local pid
@@ -295,12 +468,12 @@ verify_server() {
             local log_status
             log_status=$(ssh ${SSH_OPTS} \
                 ${SERVER_USER}@${SERVER_IP} \
-                "cat /tmp/ib_lat_server_${size}.log 2>/dev/null")
+                "cat /tmp/ib_lat_server.log 2>/dev/null")
 
             if echo "${log_status}" | grep -qiE "error|failed|cannot|unable"; then
-                echo "[ERROR] server启动失败 size=${size}" >> ${RAW_LOG}
-                echo "${log_status}"                       >> ${RAW_LOG}
-                echo -e "${RED}[ERROR] size=${size} server启动失败，详情见: ${RAW_LOG}${NC}" >&2
+                echo "[ERROR] server启动失败" >> ${RAW_LOG}
+                echo "${log_status}"           >> ${RAW_LOG}
+                echo -e "${RED}[ERROR] server启动失败，详情见: ${RAW_LOG}${NC}" >&2
                 return 1
             fi
 
@@ -316,65 +489,76 @@ verify_server() {
     local timeout_log
     timeout_log=$(ssh ${SSH_OPTS} \
         ${SERVER_USER}@${SERVER_IP} \
-        "cat /tmp/ib_lat_server_${size}.log 2>/dev/null")
-    echo "[ERROR] server启动超时 size=${size}" >> ${RAW_LOG}
-    echo "${timeout_log}"                      >> ${RAW_LOG}
-    echo -e "${RED}[ERROR] size=${size} server启动超时，详情见: ${RAW_LOG}${NC}" >&2
+        "cat /tmp/ib_lat_server.log 2>/dev/null")
+    echo "[ERROR] server启动超时" >> ${RAW_LOG}
+    echo "${timeout_log}"          >> ${RAW_LOG}
+    echo -e "${RED}[ERROR] server启动超时，详情见: ${RAW_LOG}${NC}" >&2
     return 1
 }
 
 #===========================================
-# 执行client测试
+# 执行client测试（-a模式，测试完成后一次性输出结果）
+# 参数: [use_cuda]  - "cuda" 表示使用GDR
 #===========================================
 run_client() {
-    local size=$1
+    local use_cuda=$1
+    local cuda_param=""
+    [ "${use_cuda}" = "cuda" ] && cuda_param="--use_cuda=${LOCAL_GPU_ID}"
 
     local stderr_tmp=$(mktemp)
-    local raw_output
-    raw_output=$(timeout ${CLIENT_TIMEOUT} ${LOCAL_NUMA_PREFIX} ${IB_TOOL} \
+    local stdout_tmp=$(mktemp)
+
+    echo -ne "${YELLOW}  测试中（所有消息大小）...${NC}" >&2
+
+    timeout ${CLIENT_TIMEOUT} ${LOCAL_NUMA_PREFIX} ${IB_TOOL} \
         -x ${GID_INDEX} \
         -n ${ITERATIONS} \
         --tclass=${TCLASS} \
         --ib-dev=${IB_DEV} \
-        -s ${size} \
-        ${SERVER_BOND_IP} 2>${stderr_tmp})
+        -a -F \
+        ${cuda_param} \
+        ${SERVER_BOND_IP} >${stdout_tmp} 2>${stderr_tmp} &
+    local client_pid=$!
+    wait ${client_pid} 2>/dev/null
     local rc=$?
 
     {
-        echo "=== size=${size} rc=${rc} ==="
-        echo "$raw_output"
+        echo "=== rc=${rc} ==="
+        cat "${stdout_tmp}"
         if [ -s "${stderr_tmp}" ]; then
             echo "--- stderr ---"
             cat "${stderr_tmp}"
         fi
     } >> ${RAW_LOG}
-    rm -f "${stderr_tmp}"
+
+    printf "\r\033[2K" >&2
 
     if [ ${rc} -eq 124 ]; then
-        echo -e "${RED}[ERROR] size=${size} client测试超时(${CLIENT_TIMEOUT}s)，跳过${NC}" >&2
+        echo -e "${RED}[ERROR] client测试超时(${CLIENT_TIMEOUT}s)${NC}" >&2
+        rm -f "${stderr_tmp}" "${stdout_tmp}"
         return 124
-    elif [ ${rc} -ne 0 ]; then
-        echo -e "${RED}[ERROR] size=${size} client测试失败(rc=${rc})，详情见: ${RAW_LOG}${NC}" >&2
+    elif [ ${rc} -ne 0 ] && [ ${rc} -ne 143 ]; then
+        echo -e "${RED}[ERROR] client测试失败(rc=${rc})，详情见: ${RAW_LOG}${NC}" >&2
+        rm -f "${stderr_tmp}" "${stdout_tmp}"
+        return ${rc}
     fi
 
-    # 提取数据行
-    local data_line
-    data_line=$(echo "$raw_output" \
-        | grep -E "^[[:space:]]*[0-9]+" \
-        | grep -v "^[[:space:]]*#" \
-        | tail -1)
+    local data_lines
+    data_lines=$(grep -E "^[[:space:]]*[0-9]+" "${stdout_tmp}" | grep -v "^[[:space:]]*#")
 
-    if [ -n "$data_line" ]; then
+    rm -f "${stderr_tmp}" "${stdout_tmp}"
+
+    if [ -z "$data_lines" ]; then
+        echo -e "${RED}[WARN] 未获取到数据，详情见: ${RAW_LOG}${NC}" >&2
+        return 1
+    fi
+
+    while IFS= read -r line; do
         local formatted
-        formatted=$(print_row "$data_line")
+        formatted=$(print_row "$line")
         echo "$formatted"
         echo "$formatted" >> ${RESULT_FILE}
-    else
-        echo -e "${RED}[WARN] size=${size} 未获取到数据，详情见: ${RAW_LOG}${NC}" >&2
-        printf "%-12s %-14s %-14s %-14s %-18s %-14s %-16s %-24s %-s\n" \
-            "${size}" "-" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" \
-            >> ${RESULT_FILE}
-    fi
+    done <<< "$data_lines"
 }
 
 #===========================================
@@ -402,10 +586,12 @@ trap cleanup_on_exit INT TERM
 run_single_test() {
     local test_name=$1
 
+    local prefix=""
+    [ -n "${PERFTEST_PATH}" ] && prefix="${PERFTEST_PATH%/}/"
     case ${test_name} in
-        write) IB_TOOL="ib_write_lat" ;;
-        read)  IB_TOOL="ib_read_lat"  ;;
-        send)  IB_TOOL="ib_send_lat"  ;;
+        write) IB_TOOL="${prefix}ib_write_lat" ;;
+        read)  IB_TOOL="${prefix}ib_read_lat"  ;;
+        send)  IB_TOOL="${prefix}ib_send_lat"  ;;
     esac
 
     local client_ip_tag=${CLIENT_MGMT_IP}
@@ -414,6 +600,25 @@ run_single_test() {
     RAW_LOG="${OUTPUT_DIR}/perf_${client_ip_tag}_${server_ip_tag}_ib_${test_name}_lat_raw_${TIMESTAMP}.log"
 
     check_tool "${IB_TOOL}"
+
+    # 检查GDR环境（仅在 --gdr 时检测）
+    GDR_AVAILABLE="false"
+    if [ "${ENABLE_GDR}" = "true" ]; then
+        GDR_AVAILABLE=$(check_gdr)
+    fi
+
+    # 获取GPU ID
+    LOCAL_GPU_ID=""
+    REMOTE_GPU_ID=""
+    if [ "${GDR_AVAILABLE}" = "true" ]; then
+        if [ "${GPU_AFFINITY}" = "true" ]; then
+            LOCAL_GPU_ID=$(get_affinity_gpus "${IB_DEV}")
+            REMOTE_GPU_ID=$(get_affinity_gpus "${IB_DEV}" "remote")
+        else
+            LOCAL_GPU_ID="0"
+            REMOTE_GPU_ID="0"
+        fi
+    fi
 
     # 获取 NUMA 节点
     LOCAL_NUMA=$(get_numa_node "${IB_DEV}")
@@ -439,10 +644,12 @@ run_single_test() {
     [ -n "${REMOTE_NUMA_PREFIX}" ] && numa_srv_prefix="${REMOTE_NUMA_PREFIX} "
     local numa_cli_prefix=""
     [ -n "${LOCAL_NUMA_PREFIX}" ] && numa_cli_prefix="${LOCAL_NUMA_PREFIX} "
-    local server_cmd="${numa_srv_prefix}${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s <size>"
-    local client_cmd="${numa_cli_prefix}${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -s <size> ${SERVER_BOND_IP}"
+    local server_cmd_mem="${numa_srv_prefix}${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -a -F"
+    local client_cmd_mem="${numa_cli_prefix}${IB_TOOL} -x ${GID_INDEX} -n ${ITERATIONS} --tclass=${TCLASS} --ib-dev=${IB_DEV} -a -F ${SERVER_BOND_IP}"
+    local server_cmd_gdr="${server_cmd_mem} --use_cuda=${REMOTE_GPU_ID}"
+    local client_cmd_gdr="${client_cmd_mem} --use_cuda=${LOCAL_GPU_ID}"
 
-    # 写入结果文件头部（仅基本信息）
+    # 写入结果文件头部
     {
         echo "########################################"
         echo "# ${IB_TOOL} 延迟测试结果"
@@ -457,11 +664,17 @@ run_single_test() {
         echo "# Client NUMA  : ${LOCAL_NUMA:-N/A}"
         echo "# Server NUMA  : ${REMOTE_NUMA:-N/A}"
         echo "# NUMA绑定    : ${NUMA_AFFINITY}"
+        echo "# GDR可用      : ${GDR_AVAILABLE}"
+        if [ "${GDR_AVAILABLE}" = "true" ]; then
+            echo "# GPU亲和      : ${GPU_AFFINITY}"
+            echo "# Client GPU   : ${LOCAL_GPU_ID}"
+            echo "# Server GPU   : ${REMOTE_GPU_ID}"
+        fi
         echo "########################################"
         echo ""
     } > ${RESULT_FILE}
 
-    # 写入RAW日志头部（含详细测试命令信息）
+    # 写入RAW日志头部
     {
         echo "########################################"
         echo "# ${IB_TOOL} 延迟测试 RAW LOG"
@@ -478,10 +691,21 @@ run_single_test() {
         echo "# Client NUMA  : ${LOCAL_NUMA:-N/A}"
         echo "# Server NUMA  : ${REMOTE_NUMA:-N/A}"
         echo "# NUMA绑定    : ${NUMA_AFFINITY}"
+        echo "# GDR可用      : ${GDR_AVAILABLE}"
+        if [ "${GDR_AVAILABLE}" = "true" ]; then
+            echo "# GPU亲和      : ${GPU_AFFINITY}"
+            echo "# Client GPU   : ${LOCAL_GPU_ID}"
+            echo "# Server GPU   : ${REMOTE_GPU_ID}"
+        fi
         echo "#"
-        echo "# 测试命令:"
-        echo "#   [Server端] ${server_cmd}"
-        echo "#   [Client端] ${client_cmd}"
+        echo "# 测试命令 (Mem):"
+        echo "#   [Server端] ${server_cmd_mem}"
+        echo "#   [Client端] ${client_cmd_mem}"
+        if [ "${GDR_AVAILABLE}" = "true" ]; then
+            echo "# 测试命令 (GDR):"
+            echo "#   [Server端] ${server_cmd_gdr}"
+            echo "#   [Client端] ${client_cmd_gdr}"
+        fi
         echo "########################################"
         echo ""
     } >> ${RAW_LOG}
@@ -492,43 +716,66 @@ run_single_test() {
     echo "Client NUMA  : ${LOCAL_NUMA:-N/A}"
     echo "Server NUMA  : ${REMOTE_NUMA:-N/A}"
     echo "NUMA绑定     : ${NUMA_AFFINITY}"
+    echo "GDR可用      : ${GDR_AVAILABLE}"
+    if [ "${GDR_AVAILABLE}" = "true" ]; then
+        echo "GPU亲和      : ${GPU_AFFINITY}"
+        echo "Client GPU   : ${LOCAL_GPU_ID}"
+        echo "Server GPU   : ${REMOTE_GPU_ID}"
+    fi
     echo "结果文件     : ${RESULT_FILE}"
-    echo ""
 
     # 清理残留进程
     kill_server 2>/dev/null
 
-    # 打印表头（终端+文件）
+    local total_scenes=1
+    [ "${GDR_AVAILABLE}" = "true" ] && total_scenes=2
+
+    # === 1. 内存测试 ===
+    echo ""
+    echo -e "${BLUE}--- 1/${total_scenes} Mem ---${NC}"
+    echo "# 1. Mem" >> ${RAW_LOG}
+
     local header
     header=$(print_header)
     echo "$header"
     echo "$header" >> ${RESULT_FILE}
 
-    local total=${#SIZES[@]}
-    local idx=0
+    start_server ""
 
-    for size in "${SIZES[@]}"; do
-        idx=$((idx + 1))
-        echo -ne "${YELLOW}  [${idx}/${total}] size=${size} 测试中...${NC}\r" >&2
-
-        start_server ${size}
-
-        if ! verify_server ${size}; then
-            echo -e "${RED}  [${idx}/${total}] size=${size} server启动失败${NC}" >&2
-            printf "%-12s %-14s %-14s %-14s %-18s %-14s %-16s %-24s %-s\n" \
-                "${size}" "-" "ERR" "ERR" "ERR" "ERR" "ERR" "ERR" "ERR" \
-                | tee -a ${RESULT_FILE}
-            kill_server 2>/dev/null
-            continue
-        fi
-
-        run_client ${size}
-        local client_rc=$?
+    if ! verify_server; then
+        echo -e "${RED}[ERROR] Mem server启动失败${NC}" >&2
         kill_server 2>/dev/null
-        if [ ${client_rc} -eq 124 ]; then
-            continue
+    else
+        run_client ""
+        kill_server 2>/dev/null
+    fi
+
+    # === 2. GDR测试（仅 --gdr 且 GPU 可用时执行）===
+    if [ "${GDR_AVAILABLE}" = "true" ]; then
+        echo ""
+        echo -e "${BLUE}--- 2/${total_scenes} GDR (Client GPU ${LOCAL_GPU_ID}, Server GPU ${REMOTE_GPU_ID}) ---${NC}"
+        echo "# 2. GDR" >> ${RAW_LOG}
+        echo "" >> ${RESULT_FILE}
+        echo "# GDR (Client GPU ${LOCAL_GPU_ID}, Server GPU ${REMOTE_GPU_ID})" >> ${RESULT_FILE}
+
+        header=$(print_header)
+        echo "$header"
+        echo "$header" >> ${RESULT_FILE}
+
+        start_server "cuda"
+
+        if ! verify_server; then
+            echo -e "${RED}[ERROR] GDR server启动失败${NC}" >&2
+            kill_server 2>/dev/null
+        else
+            run_client "cuda"
+            kill_server 2>/dev/null
         fi
-    done
+    elif [ "${ENABLE_GDR}" = "true" ]; then
+        echo ""
+        echo -e "${RED}[SKIP] GPU不可用，跳过GDR时延测试${NC}"
+        echo "# 2. GDR (跳过)" >> ${RAW_LOG}
+    fi
 
     echo ""
     echo -e "${GREEN}${IB_TOOL} 测试完成，结果文件: ${RESULT_FILE}${NC}"
