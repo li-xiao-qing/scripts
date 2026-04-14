@@ -10,26 +10,24 @@
 # 使用方法
 #===========================================
 usage() {
-    echo "用法: $0 [选项] [测试类型]"
-    echo ""
-    echo "测试类型:"
-    echo "  all     - 依次执行 write/read/send (默认)"
-    echo "  write   - ib_write_bw"
-    echo "  read    - ib_read_bw"
-    echo "  send    - ib_send_bw"
+    echo "用法: $0 [选项]"
     echo ""
     echo "选项:"
+    echo "  -t TYPE           测试类型: all(默认)/write/read/send"
     echo "  --dual-gpu        启用双卡GDR测试（同bond下2张GPU并行，带宽求和）"
-    echo "  --no-numa         禁用内存测试的NUMA亲和绑定（默认启用）"
     echo "  --no-gpu-affinity 禁用GDR测试的网卡-显卡亲和检测，使用GPU 0（默认启用亲和）"
+    echo "  --no-numa         禁用NUMA亲和绑定（默认启用）"
+    echo "  --perftest-path PATH  指定perftest工具目录（如 /opt/pg1-tests/perftest/bin）"
+    echo "                        默认使用系统PATH中的perftest"
     echo ""
     echo "示例:"
-    echo "  $0                  # 执行 write/read/send 全部测试"
-    echo "  $0 write            # 仅执行 write 测试"
-    echo "  $0 --dual-gpu       # 全部测试 + 额外双卡GDR场景(9-12)"
-    echo "  $0 --dual-gpu write # 仅 write + 额外双卡GDR场景"
-    echo "  $0 --no-numa        # 全部测试，不绑定NUMA"
-    echo "  $0 --no-gpu-affinity # 全部测试，GDR使用GPU 0"
+    echo "  $0                    # 执行 write/read/send 全部测试"
+    echo "  $0 -t write           # 仅执行 write 测试"
+    echo "  $0 --dual-gpu         # 全部测试 + 额外双卡GDR场景(9-12)"
+    echo "  $0 -t write --dual-gpu  # 仅 write + 额外双卡GDR场景"
+    echo "  $0 --no-numa          # 全部测试，不绑定NUMA"
+    echo "  $0 --no-gpu-affinity  # 全部测试，GDR使用GPU 0"
+    echo "  $0 --perftest-path /opt/pg1-tests/perftest/bin"
     exit 1
 }
 
@@ -39,15 +37,17 @@ usage() {
 DUAL_GPU=false
 NUMA_AFFINITY=true
 GPU_AFFINITY=true
+PERFTEST_PATH=""
 TEST_TYPE="all"
 
 while [ $# -gt 0 ]; do
     case $1 in
+        -t)                TEST_TYPE="$2"; shift 2 ;;
         --dual-gpu)        DUAL_GPU=true; shift ;;
         --no-numa)         NUMA_AFFINITY=false; shift ;;
         --no-gpu-affinity) GPU_AFFINITY=false; shift ;;
+        --perftest-path)   PERFTEST_PATH="$2"; shift 2 ;;
         -h|--help)  usage ;;
-        all|write|read|send) TEST_TYPE=$1; shift ;;
         *)
             echo "不支持的参数: $1"
             usage
@@ -55,15 +55,20 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+case ${TEST_TYPE} in
+    all|write|read|send) ;;
+    *) echo "不支持的测试类型: ${TEST_TYPE}"; usage ;;
+esac
+
 #===========================================
 # 配置区域
 #===========================================
-SERVER_IP="10.36.33.113"        # 管理IP，仅用于SSH登录
+SERVER_IP="10.36.33.111"        # 管理IP，仅用于SSH登录
 SERVER_USER="root"
 IB_DEV="mlx5_bond_2"
 TCLASS="16"
 GID_INDEX="3"
-DURATION="1"
+DURATION="5"
 MSG_SIZE="65536"
 SERVER_WAIT_TIMEOUT=10
 CLIENT_TIMEOUT=60
@@ -387,16 +392,28 @@ check_ssh() {
 #===========================================
 check_tool() {
     local tool=$1
-    if ! command -v ${tool} &> /dev/null; then
-        echo -e "${RED}[ERROR] 本机未找到 ${tool}，请安装 perftest${NC}"
-        exit 1
-    fi
-    ssh ${SSH_OPTS} \
-        ${SERVER_USER}@${SERVER_IP} \
-        "command -v ${tool}" &>/dev/null
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}[ERROR] server端未找到 ${tool}，请安装 perftest${NC}"
-        exit 1
+    if [[ "${tool}" == /* ]]; then
+        if [ ! -x "${tool}" ]; then
+            echo -e "${RED}[ERROR] 本机未找到 ${tool}${NC}"
+            exit 1
+        fi
+        ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+            "test -x ${tool}" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}[ERROR] server端未找到 ${tool}${NC}"
+            exit 1
+        fi
+    else
+        if ! command -v ${tool} &> /dev/null; then
+            echo -e "${RED}[ERROR] 本机未找到 ${tool}，请安装 perftest${NC}"
+            exit 1
+        fi
+        ssh ${SSH_OPTS} ${SERVER_USER}@${SERVER_IP} \
+            "command -v ${tool}" &>/dev/null
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}[ERROR] server端未找到 ${tool}，请安装 perftest${NC}"
+            exit 1
+        fi
     fi
 }
 
@@ -901,10 +918,12 @@ trap cleanup_on_exit INT TERM
 run_single_test() {
     local test_name=$1
 
+    local prefix=""
+    [ -n "${PERFTEST_PATH}" ] && prefix="${PERFTEST_PATH%/}/"
     case ${test_name} in
-        write) IB_TOOL="/opt/pg1-tests/perftest/bin/ib_write_bw" ;;
-        read)  IB_TOOL="/opt/pg1-tests/perftest/bin/ib_read_bw"  ;;
-        send)  IB_TOOL="/opt/pg1-tests/perftest/bin/ib_send_bw"  ;;
+        write) IB_TOOL="${prefix}ib_write_bw" ;;
+        read)  IB_TOOL="${prefix}ib_read_bw"  ;;
+        send)  IB_TOOL="${prefix}ib_send_bw"  ;;
     esac
 
     local client_ip_tag=${CLIENT_MGMT_IP}
@@ -924,8 +943,13 @@ run_single_test() {
             local_gpu_str=$(get_affinity_gpus "${IB_DEV}")
             remote_gpu_str=$(get_affinity_gpus "${IB_DEV}" "remote")
         else
-            local_gpu_str="0"
-            remote_gpu_str="0"
+            if [ "${DUAL_GPU}" = "true" ]; then
+                local_gpu_str="0 1"
+                remote_gpu_str="0 1"
+            else
+                local_gpu_str="0"
+                remote_gpu_str="0"
+            fi
         fi
         read -ra LOCAL_GPU_IDS <<< "$local_gpu_str"
         read -ra REMOTE_GPU_IDS <<< "$remote_gpu_str"
