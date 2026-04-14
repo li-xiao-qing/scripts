@@ -1,32 +1,45 @@
 #!/bin/bash
-# lldp_switch_discover.sh
+# switch_discover.sh
 # 批量探测服务器Bond网卡上联交换机信息（优先 lldptool，备选 tcpdump）
 
 #===========================================
 # 使用方法
 #===========================================
 usage() {
-    echo "用法: $0 <ip_list文件> <bond名称>"
+    echo "用法: $0 [选项]"
+    echo ""
+    echo "选项:"
+    echo "  -f, --file FILE    IP列表文件（每行一个IP，必需）"
+    echo "  -b, --bond NAME    Bond名称（如 bond2，必需）"
+    echo "  -h, --help         显示帮助信息"
     echo ""
     echo "示例:"
-    echo "  $0 iplist.txt bond2"
-    echo ""
-    echo "ip_list文件格式（每行一个IP）:"
-    echo "  10.36.33.113"
-    echo "  10.36.33.170"
-    echo "  ..."
+    echo "  $0 -f iplist.txt -b bond2"
     exit 1
 }
 
 #===========================================
-# 参数检查
+# 解析参数
 #===========================================
-if [ $# -ne 2 ]; then
+IP_LIST_FILE=""
+BOND_NAME=""
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -f|--file) IP_LIST_FILE="$2"; shift 2 ;;
+        -b|--bond) BOND_NAME="$2"; shift 2 ;;
+        -h|--help) usage ;;
+        *)
+            echo "不支持的参数: $1"
+            usage
+            ;;
+    esac
+done
+
+if [ -z "${IP_LIST_FILE}" ] || [ -z "${BOND_NAME}" ]; then
+    echo "[ERROR] 必须指定 -f <IP列表文件> 和 -b <Bond名称>"
     usage
 fi
-
-IP_LIST_FILE=$1
-BOND_NAME=$2
 
 if [ ! -f "${IP_LIST_FILE}" ]; then
     echo "[ERROR] IP列表文件不存在: ${IP_LIST_FILE}"
