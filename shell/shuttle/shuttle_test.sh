@@ -2,7 +2,7 @@
 ###############################################################################
 # Shuttle 多维度组网测试脚本
 # 测试维度: (incast, m2n, all2all) × (mem, gdr) × qp数量
-# 运行命令: ./shuttle continuous -role master -cfg <config>
+# 底层运行命令: ./shuttle continuous -role master -cfg <config> -bind
 #
 # Usage: ./shuttle_test.sh [OPTIONS]
 #
@@ -15,6 +15,7 @@
 #   -m, --mode MODE         测试模式: mem, gdr, all (默认: all)
 #   -q, --qp-list LIST      QP列表, 逗号分隔 (默认: 1,4,8,16,32,64,128,256,512)
 #   -d, --duration SEC      每个测试case的持续时间(秒) (默认: 30)
+#   --no-bind               禁用网卡绑核（默认启用 -bind，保证CPU亲和性）
 #   --dry-run               仅显示要执行的命令, 不实际运行
 #
 # 示例:
@@ -36,6 +37,7 @@ ALL_MODES=("mem" "gdr")
 ALL_QP_LIST=(1 4 8 16 32 64 128 256 512)
 
 DURATION=30
+BIND_CORE="true"
 DRY_RUN="false"
 SELECTED_TYPES=()
 SELECTED_MODES=()
@@ -91,6 +93,7 @@ OPTIONS:
     -m, --mode MODE         测试模式: mem, gdr, all (默认: all)
     -q, --qp-list LIST      QP列表, 逗号分隔, 如 "1,4,8,16" (默认: 1,4,8,16,32,64,128,256,512)
     -d, --duration SEC      每个测试case的持续时间, 秒 (默认: 30)
+    --no-bind               禁用网卡绑核（默认启用 -bind，保证CPU亲和性）
     --dry-run               仅显示要执行的命令, 不实际运行
 
 示例:
@@ -351,7 +354,7 @@ run_shuttle() {
     } >> "${raw_log}"
 
     local shuttle_output
-    shuttle_output=$("$SHUTTLE_BIN" continuous -role master -cfg "$config_file" 2>&1)
+    shuttle_output=$("$SHUTTLE_BIN" continuous -role master ${bind_arg} -cfg "$config_file" 2>&1)
     local exit_code=$?
 
     local end_time
@@ -645,6 +648,10 @@ main() {
                 [[ $# -ge 2 ]] || { echo -e "${RED}[ERROR] -d/--duration 需要指定秒数${NC}" >&2; exit 1; }
                 DURATION="$2"
                 shift 2
+                ;;
+            --no-bind)
+                BIND_CORE="false"
+                shift
                 ;;
             --dry-run)
                 DRY_RUN="true"
